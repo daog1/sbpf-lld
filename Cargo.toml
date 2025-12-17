@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 bpf-linker = "0.9.15"
+clap = { version = "4.5", features = ["derive"] }
 object = { version = "0.38.0", features = ["write_core","elf"] }
 thiserror = "2.0.17"
 

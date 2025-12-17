@@ -45,6 +45,13 @@ cargo install sbpf-lld
 sbpf-lld input1.o input2.o output.so
 ```
 
+### With `-o/--out`
+
+```bash
+sbpf-lld -o output.so input1.o input2.o
+sbpf-lld --out output.so input1.o input2.o
+```
+
 
 ## Architecture Design
 
