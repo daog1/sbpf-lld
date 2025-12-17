@@ -67,7 +67,19 @@ impl<'a> ElfObject<'a> {
 
     fn reserve_layout(&mut self, sbpf: &RawSbpfData) -> Layout {
         let text_size = sbpf.text_bytes.len();
-        let relocation_count = sbpf.relocations.len();
+        let relocation_count = sbpf
+            .relocations
+            .iter()
+            .filter(|reloc| {
+                if reloc.is_syscall {
+                    return true;
+                }
+                if reloc.symbol_name.is_empty() {
+                    return true;
+                }
+                sbpf.rodata_symbols.contains_key(&reloc.symbol_name)
+            })
+            .count();
 
         // Reserve file header and program headers
         self.writer.reserve_file_header();
@@ -106,20 +118,25 @@ impl<'a> ElfObject<'a> {
         let mut dynstr_size = 1u64; // Starting empty string
         for reloc in &sbpf.relocations {
             if !reloc.is_syscall {
-                // Record rodata absolute addresses for LDDW and RELATIVE relocations
-                let key_name = if reloc.symbol_name.is_empty() {
-                    format!("rodata_{:x}", reloc.symbol_address)
+                // Record rodata absolute addresses for LDDW and RELATIVE relocations.
+                // Important: only treat relocations as rodata if they are explicitly
+                // rodata symbols (or anonymous, address-based rodata references).
+                // Otherwise, we may accidentally patch CALL immediates and trigger
+                // `RelativeJumpOutOfBounds` in the SBPF loader.
+                let (key_name, abs_addr) = if reloc.symbol_name.is_empty() {
+                    (
+                        format!("rodata_{:x}", reloc.symbol_address),
+                        rodata_offset as u64 + reloc.symbol_address,
+                    )
+                } else if let Some(off) = sbpf.rodata_symbols.get(&reloc.symbol_name) {
+                    (reloc.symbol_name.clone(), rodata_offset as u64 + *off)
                 } else {
-                    reloc.symbol_name.clone()
+                    continue;
                 };
                 if rodata_addrs.contains_key(&key_name) {
                     continue;
                 }
-                if let Some(off) = sbpf.rodata_symbols.get(&reloc.symbol_name) {
-                    rodata_addrs.insert(key_name, rodata_offset as u64 + *off);
-                } else if reloc.symbol_address != 0 {
-                    rodata_addrs.insert(key_name, rodata_offset as u64 + reloc.symbol_address);
-                }
+                rodata_addrs.insert(key_name, abs_addr);
                 continue;
             }
             if syscall_lookup.contains_key(&reloc.symbol_name) {
@@ -390,4 +407,27 @@ pub fn build_sbpf_so(data: &RawSbpfData) -> Result<Vec<u8>> {
         elf_obj.gen_elf(data)?;
     }
     Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw_parser::RawRelocation;
+
+    #[test]
+    fn build_sbpf_so_skips_non_rodata_non_syscall_relocs() {
+        let mut data = RawSbpfData::new();
+        data.text_bytes = vec![0u8; 16];
+        data.relocations.push(RawRelocation {
+            offset: 0,
+            symbol_name: "_ZN4core9panicking18panic_bounds_check17hf0c02a9253951be5E".into(),
+            symbol_address: 0,
+            is_syscall: false,
+            is_core_lib: true,
+            addend: 0,
+        });
+
+        let elf = build_sbpf_so(&data).expect("ELF build should succeed");
+        assert!(!elf.is_empty());
+    }
 }
