@@ -22,7 +22,7 @@ pub mod raw_parser;
 ))]
 use aya_rustc_llvm_proxy as _;
 
-pub use elf_object::{build_sbpf_so,ElfBuildError};
+pub use elf_object::{ElfBuildError, build_sbpf_so};
 pub use raw_parser::{RawRelocation, RawSbpfData, RawSbpfError};
 
 /// Detect Solana syscalls in input files
@@ -70,17 +70,18 @@ fn link_with_bpf_linker(inputs: &[PathBuf], temp_output: &PathBuf) -> Result<()>
         libs: Vec::new(),
         optimize: OptLevel::No,
         export_symbols,
-        unroll_loops: false,
+        unroll_loops: true,
         ignore_inline_never: false,
         dump_module: None,
         llvm_args: Vec::new(),
         disable_expand_memcpy_in_order: true,
-        disable_memory_builtins: false, // Disable memory builtin functions
+        disable_memory_builtins: true, // Disable memory builtin functions
         btf: false,
         allow_bpf_trap: false,
     });
 
-    linker.link()
+    linker
+        .link()
         .with_context(|| format!("Failed to link files to {}", temp_output.display()))?;
 
     // Check for any linker errors or warnings
@@ -97,12 +98,15 @@ pub fn full_link_program(inputs: &[PathBuf]) -> Result<Vec<u8>> {
     let temp_output = PathBuf::from("temp_linked.o");
 
     // 1. Link input files using bpf-linker
-    link_with_bpf_linker(inputs, &temp_output)
-        .context("Failed during bpf-linker phase")?;
+    link_with_bpf_linker(inputs, &temp_output).context("Failed during bpf-linker phase")?;
 
     // 2. Read the linked result
-    let linked_bytes = fs::read(&temp_output)
-        .with_context(|| format!("Failed to read linked output file: {}", temp_output.display()))?;
+    let linked_bytes = fs::read(&temp_output).with_context(|| {
+        format!(
+            "Failed to read linked output file: {}",
+            temp_output.display()
+        )
+    })?;
     println!("bpf-linker output: {} bytes", linked_bytes.len());
 
     // 3. Clean up temporary file
@@ -113,12 +117,12 @@ pub fn full_link_program(inputs: &[PathBuf]) -> Result<Vec<u8>> {
         .context("Failed to parse linked object file")?;
 
     // 5. Apply relocations
-    sbpf_data.apply_relocations()
+    sbpf_data
+        .apply_relocations()
         .context("Failed to apply relocations")?;
 
     // 6. Build the final .so file
-    let output_bytes = build_sbpf_so(&sbpf_data)
-        .context("Failed to build final ELF file")?;
+    let output_bytes = build_sbpf_so(&sbpf_data).context("Failed to build final ELF file")?;
 
     Ok(output_bytes)
 }

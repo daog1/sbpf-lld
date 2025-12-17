@@ -359,20 +359,18 @@ impl<'a> ElfObject<'a> {
             sh_addralign: 4,
             sh_entsize: 0,
         });
-        if layout.rodata_size > 0 {
-            self.writer.write_section_header(&SectionHeader {
-                name: Some(layout.rodata_name),
-                sh_type: elf::SHT_PROGBITS,
-                sh_flags: elf::SHF_ALLOC as u64,
-                sh_addr: layout.rodata_offset as u64,
-                sh_offset: layout.rodata_offset as u64,
-                sh_size: rodata_size,
-                sh_link: 0,
-                sh_info: 0,
-                sh_addralign: 1,
-                sh_entsize: 0,
-            });
-        }
+        self.writer.write_section_header(&SectionHeader {
+            name: Some(layout.rodata_name),
+            sh_type: elf::SHT_PROGBITS,
+            sh_flags: elf::SHF_ALLOC as u64,
+            sh_addr: layout.rodata_offset as u64,
+            sh_offset: layout.rodata_offset as u64,
+            sh_size: rodata_size,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 1,
+            sh_entsize: 0,
+        });
         self.writer
             .write_dynamic_section_header(layout.dynamic_offset as u64);
         self.writer.write_dynsym_section_header(
@@ -413,6 +411,26 @@ pub fn build_sbpf_so(data: &RawSbpfData) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::raw_parser::RawRelocation;
+
+    #[test]
+    fn build_sbpf_so_has_complete_section_table_when_rodata_empty() {
+        let mut data = RawSbpfData::new();
+        data.text_bytes = vec![0u8; 16];
+        data.rodata_bytes = Vec::new();
+
+        let elf = build_sbpf_so(&data).expect("ELF build should succeed");
+        assert!(!elf.is_empty());
+
+        let e_shoff = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
+        let e_shentsize = u16::from_le_bytes(elf[0x3A..0x3C].try_into().unwrap()) as usize;
+        let e_shnum = u16::from_le_bytes(elf[0x3C..0x3E].try_into().unwrap()) as usize;
+        let section_table_end = e_shoff + (e_shentsize * e_shnum);
+        assert!(
+            section_table_end <= elf.len(),
+            "section table overruns file: end={section_table_end} len={}",
+            elf.len()
+        );
+    }
 
     #[test]
     fn build_sbpf_so_skips_non_rodata_non_syscall_relocs() {
