@@ -276,20 +276,35 @@ impl<'a> ElfObject<'a> {
         }
 
         self.writer.write_align_dynamic();
-        self.writer.write_dynamic(elf::DT_FLAGS, elf::DF_TEXTREL as u64);
+        let rel_addr = if rel_dyn_size > 0 {
+            layout.rel_dyn_offset as u64
+        } else {
+            0
+        };
+
+        // If there are no relocations, avoid emitting a DT_REL pointer that points outside any
+        // PT_LOAD segment, otherwise mollusk will fail with "invalid dynamic section table".
         self.writer
-            .write_dynamic(elf::DT_REL, layout.rel_dyn_offset as u64);
+            .write_dynamic(elf::DT_FLAGS, if rel_dyn_size > 0 { elf::DF_TEXTREL as u64 } else { 0 });
+        self.writer.write_dynamic(elf::DT_REL, rel_addr);
         self.writer.write_dynamic(elf::DT_RELSZ, rel_dyn_size);
         self.writer.write_dynamic(elf::DT_RELENT, 0x10);
-        self.writer
-            .write_dynamic(elf::DT_RELCOUNT, layout.relocation_count as u64);
+        self.writer.write_dynamic(
+            elf::DT_RELCOUNT,
+            if rel_dyn_size > 0 {
+                layout.relocation_count as u64
+            } else {
+                0
+            },
+        );
         self.writer
             .write_dynamic(elf::DT_SYMTAB, layout.dynsym_offset as u64);
         self.writer.write_dynamic(elf::DT_SYMENT, 0x18);
         self.writer
             .write_dynamic(elf::DT_STRTAB, layout.dynstr_offset as u64);
         self.writer.write_dynamic(elf::DT_STRSZ, layout.dynstr_size);
-        self.writer.write_dynamic(elf::DT_TEXTREL, 0);
+        self.writer
+            .write_dynamic(elf::DT_TEXTREL, if rel_dyn_size > 0 { 0 } else { 0 });
 
         self.writer.write_null_dynamic_symbol();
         for symbol in &layout.syscall_symbols {
