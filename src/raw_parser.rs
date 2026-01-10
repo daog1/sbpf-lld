@@ -42,11 +42,11 @@ pub const REGISTERED_SYSCALLS: &[&str] = &[
 /// Complete data extraction based on original byteparser.rs
 #[derive(Debug)]
 pub struct RawSbpfData {
-    pub text_bytes: Vec<u8>,             // .text section raw bytes
-    pub rodata_bytes: Vec<u8>,           // .rodata section raw bytes
-    pub symbols: HashMap<String, u64>,   // .text symbol name -> address
+    pub text_bytes: Vec<u8>,                  // .text section raw bytes
+    pub rodata_bytes: Vec<u8>,                // .rodata section raw bytes
+    pub symbols: HashMap<String, u64>,        // .text symbol name -> address
     pub rodata_symbols: HashMap<String, u64>, // .rodata symbol name -> offset within section
-    pub relocations: Vec<RawRelocation>, // complete relocation information
+    pub relocations: Vec<RawRelocation>,      // complete relocation information
     pub entry_address: u64,
 }
 
@@ -89,35 +89,38 @@ impl RawSbpfData {
 
     /// Extract raw SBPF data from object file
     pub fn from_object_file(bytes: &[u8]) -> Result<Self> {
-        let obj = object::File::parse(bytes)
-            .context("Failed to parse object file")?;
+        let obj = object::File::parse(bytes).context("Failed to parse object file")?;
         let mut result = Self::new();
 
         // Extract symbol table
-        result.extract_symbols(&obj)
+        result
+            .extract_symbols(&obj)
             .context("Failed to extract symbol table")?;
 
         // Extract .text section
-        result.extract_text_section(&obj)
+        result
+            .extract_text_section(&obj)
             .context("Failed to extract .text section")?;
 
         // Convert eBPF instructions to sBPF v2 encoding when explicitly enabled.
-        let enable_v2 = std::env::var("SBPF_LLD_ENABLE_V2_CONVERSION")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if enable_v2 {
-            result
-                .convert_ebpf_to_sbpf_v2()
-                .context("Failed to convert eBPF to sBPF v2")?;
-        }
+        //let enable_v2 = std::env::var("SBPF_LLD_ENABLE_V2_CONVERSION")
+        //    .ok()
+        //    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        //    .unwrap_or(false);
+        //if enable_v2 {
+        result
+            .convert_ebpf_to_sbpf_v2()
+            .context("Failed to convert eBPF to sBPF v2")?;
+        //}
 
         // Extract .rodata section
-        result.extract_rodata_section(&obj)
+        result
+            .extract_rodata_section(&obj)
             .context("Failed to extract .rodata section")?;
 
         // Extract relocation information
-        result.extract_relocations(&obj)
+        result
+            .extract_relocations(&obj)
             .context("Failed to extract relocations")?;
 
         Ok(result)
@@ -133,7 +136,7 @@ impl RawSbpfData {
                         self.entry_address = symbol.address();
                         eprintln!("entrypoint: 0x{:0x}", self.entry_address);
                     }
-                    eprintln!("add function: {} 0x{:0x}",name, symbol.address());
+                    eprintln!("add function: {} 0x{:0x}", name, symbol.address());
                 }
             } else if let Some(section_idx) = symbol.section_index() {
                 if let Ok(section) = obj.section_by_index(section_idx) {
@@ -183,11 +186,8 @@ impl RawSbpfData {
             let regs = self.text_bytes[offset + 1];
             let dst = regs & 0x0f;
             let src = (regs >> 4) & 0x0f;
-            let imm = i32::from_le_bytes(
-                self.text_bytes[offset + 4..offset + 8]
-                    .try_into()
-                    .unwrap(),
-            );
+            let imm =
+                i32::from_le_bytes(self.text_bytes[offset + 4..offset + 8].try_into().unwrap());
 
             let mut new_opcode = opcode;
             let mut new_regs = regs;
@@ -209,7 +209,7 @@ impl RawSbpfData {
                 // eBPF stores (reg) -> sBPF v2 stores
                 0x63 => new_opcode = 0x8f, // stxw
                 0x6b => new_opcode = 0x3f, // stxh
-                0x73 => new_opcode = 0x2f, // stxb
+                //0x73 => new_opcode = 0x2f, // stxb
                 0x7b => new_opcode = 0x9f, // stxdw
 
                 // eBPF ALU32 mul/div/mod -> sBPF v2 product/quotient/remainder
@@ -330,7 +330,7 @@ impl RawSbpfData {
                                 let is_syscall =
                                     REGISTERED_SYSCALLS.contains(&symbol_name_str.as_str());
                                 let is_core_lib = symbol_name_str.starts_with("_ZN4core");
-                                eprintln!("RelocationTarget {}",symbol_name_str);
+                                eprintln!("RelocationTarget {}", symbol_name_str);
                                 self.relocations.push(RawRelocation {
                                     offset,
                                     symbol_name: symbol_name_str,
@@ -351,7 +351,10 @@ impl RawSbpfData {
 
     /// Apply relocations
     pub fn apply_relocations(&mut self) -> Result<()> {
-        println!("Before applying relocations: .text section size = {}", self.text_bytes.len());
+        println!(
+            "Before applying relocations: .text section size = {}",
+            self.text_bytes.len()
+        );
 
         // Collect all relocations to apply first to avoid borrow conflicts
         let relocations: Vec<RawRelocation> = self.relocations.iter().cloned().collect();
@@ -365,7 +368,10 @@ impl RawSbpfData {
             self.apply_relocation(&reloc)?;
         }
 
-        println!("After applying relocations: .text section size = {}", self.text_bytes.len());
+        println!(
+            "After applying relocations: .text section size = {}",
+            self.text_bytes.len()
+        );
         Ok(())
     }
 
