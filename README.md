@@ -13,13 +13,14 @@ Compared to the original complex sbpf-linker implementation, this project is sig
 ## How It Works
 
 ```
-.o files → bpf-linker → byte-level relocations → .so output
+.o files → bpf-linker → byte-level relocations → eBPF→sBPF conversion → .so output
 ```
 
 1. **Input Processing**: Receives multiple BPF object files (.o)
 2. **Initial Linking**: Uses bpf-linker to link multiple input files into a single object file
 3. **Relocation Processing**: Applies SBPF-specific relocations directly at the byte level
-4. **ELF Construction**: Generates final SBPF V0 compatible shared object (.so)
+4. **eBPF to sBPF Conversion**: Converts eBPF instructions to sBPF v2 encoding
+5. **ELF Construction**: Generates final SBPF V0 compatible shared object (.so)
 
 ## Installation
 
@@ -52,6 +53,10 @@ sbpf-lld -o output.so input1.o input2.o
 sbpf-lld --out output.so input1.o input2.o
 ```
 
+### Environment Variables
+
+- `SBPF_LLD_BPF_STACK_SIZE`: Set BPF stack size (default 4096 bytes, 4KiB)
+
 
 ## Architecture Design
 
@@ -59,28 +64,29 @@ sbpf-lld --out output.so input1.o input2.o
 
 - **`RawSbpfData`**: Direct byte-level data extraction from ELF objects
 - **`murmur3_32`**: Constant-time hash function for syscall relocations
+- **`convert_ebpf_to_sbpf_v2`**: Converts eBPF instructions to sBPF v2 encoding
 - **`build_sbpf_so`**: ELF construction using object crate
 
 ### Key Technologies
 
 1. **Byte-level Operations**: Avoids parse/rebuild cycles, directly modifies byte data
 2. **Relocation Processing**:
-   - Syscall relocations: Compute murmur3_32 hash
-   - ROData relocations: Use symbol addresses
-   - Other relocations: Use addend values
-3. **ELF Construction**: Contains only necessary .text and .rodata sections
+    - Syscall relocations: Compute murmur3_32 hash
+    - ROData relocations: Use symbol addresses
+    - Other relocations: Use addend values
+3. **eBPF to sBPF Conversion**: Complete conversion from eBPF instruction set to sBPF v2 format
+4. **ELF Construction**: Contains only necessary .text and .rodata sections
 
 ## Development Status
 
 The project is ready for use and supports SVM ELF V0 format. Future versions will consider support for ELF V3 format.
 
-The project is in implementation phase, progressing step by step based on `IMPLEMENTATION_PLAN.md`:
-
 - ✅ Basic framework and data structures
 - ✅ Section data extraction
-- 🔄 Relocation processing (in progress)
-- ⏳ ELF construction
-- ⏳ Testing and verification
+- ✅ Relocation processing (completed)
+- ✅ ELF construction (completed)
+- ✅ Testing and verification (completed)
+- ✅ eBPF to sBPF v2 instruction conversion (new)
 
 ## Technology Stack
 
@@ -104,6 +110,7 @@ cargo test
 Test coverage includes:
 - Section data extraction functionality
 - Relocation application logic
+- eBPF to sBPF instruction conversion
 - ELF construction correctness
 - Compatibility verification with existing .so files
 

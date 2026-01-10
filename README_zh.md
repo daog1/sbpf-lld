@@ -13,13 +13,14 @@
 ## 工作原理
 
 ```
-.o 文件 → bpf-linker → 字节级重定位 → .so 输出
+.o 文件 → bpf-linker → 字节级重定位 → eBPF→sBPF 转换 → .so 输出
 ```
 
 1. **输入处理**: 接收多个 BPF 对象文件 (.o)
 2. **初始链接**: 使用 bpf-linker 将多个输入文件链接为单个对象文件
 3. **重定位处理**: 直接在字节级别应用 SBPF 特定的重定位
-4. **ELF 构建**: 生成最终的 SBPF V0 兼容共享对象 (.so)
+4. **eBPF 到 sBPF 转换**: 将 eBPF 指令转换为 sBPF v2 编码
+5. **ELF 构建**: 生成最终的 SBPF V0 兼容共享对象 (.so)
 
 ## 安装
 
@@ -52,6 +53,10 @@ sbpf-lld -o output.so input1.o input2.o
 sbpf-lld --out output.so input1.o input2.o
 ```
 
+### 环境变量配置
+
+- `SBPF_LLD_BPF_STACK_SIZE`: 设置 BPF 栈大小（默认 4096 字节，4KiB）
+
 ### 实际示例
 
 ```bash
@@ -71,28 +76,29 @@ just run
 
 - **`RawSbpfData`**: 直接从 ELF 对象提取字节级数据结构
 - **`murmur3_32`**: 常量时间哈希函数，用于计算 syscall 重定位
+- **`convert_ebpf_to_sbpf_v2`**: 将 eBPF 指令转换为 sBPF v2 编码
 - **`build_sbpf_so`**: 使用 object crate 构建最终 ELF 文件
 
 ### 关键技术
 
 1. **字节级操作**: 避免解析/重建循环，直接修改字节数据
 2. **重定位处理**:
-   - Syscall 重定位：计算 murmur3_32 哈希
-   - ROData 重定位：使用符号地址
-   - 其他重定位：使用附加值
-3. **ELF 构建**: 仅包含必要的 .text 和 .rodata 段
+    - Syscall 重定位：计算 murmur3_32 哈希
+    - ROData 重定位：使用符号地址
+    - 其他重定位：使用附加值
+3. **eBPF 到 sBPF 转换**: 完整的 eBPF 指令集到 sBPF v2 格式的转换
+4. **ELF 构建**: 仅包含必要的 .text 和 .rodata 段
 
 ## 开发状态
 
 项目已可使用，支持 SVM ELF V0 格式。未来版本将考虑支持 ELF V3 格式。
 
-当前项目处于实现阶段，基于 `IMPLEMENTATION_PLAN.md` 逐步推进：
-
 - ✅ 基础框架和数据结构
 - ✅ 段数据提取
-- 🔄 重定位处理（进行中）
-- ⏳ ELF 构建
-- ⏳ 测试和验证
+- ✅ 重定位处理（已完成）
+- ✅ ELF 构建（已完成）
+- ✅ 测试和验证（已完成）
+- ✅ eBPF 到 sBPF v2 指令转换（新增）
 
 ## 技术栈
 
@@ -116,6 +122,7 @@ cargo test
 测试覆盖：
 - 段数据提取功能
 - 重定位应用逻辑
+- eBPF 到 sBPF 指令转换
 - ELF 构建正确性
 - 与现有 .so 文件的兼容性验证
 
