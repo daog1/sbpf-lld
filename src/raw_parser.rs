@@ -101,6 +101,17 @@ impl RawSbpfData {
         result.extract_text_section(&obj)
             .context("Failed to extract .text section")?;
 
+        // Convert eBPF instructions to sBPF v2 encoding when explicitly enabled.
+        let enable_v2 = std::env::var("SBPF_LLD_ENABLE_V2_CONVERSION")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if enable_v2 {
+            result
+                .convert_ebpf_to_sbpf_v2()
+                .context("Failed to convert eBPF to sBPF v2")?;
+        }
+
         // Extract .rodata section
         result.extract_rodata_section(&obj)
             .context("Failed to extract .rodata section")?;
@@ -150,6 +161,107 @@ impl RawSbpfData {
                 self.validate_text_instructions()?;
                 break;
             }
+        }
+        Ok(())
+    }
+
+    /// Convert eBPF instructions to sBPF v2 encoding in-place.
+    fn convert_ebpf_to_sbpf_v2(&mut self) -> Result<()> {
+        let mut offset = 0usize;
+        while offset < self.text_bytes.len() {
+            if offset + 8 > self.text_bytes.len() {
+                break;
+            }
+
+            let opcode = self.text_bytes[offset];
+            if opcode == 0x18 {
+                // LDDW occupies two slots.
+                offset += 16;
+                continue;
+            }
+
+            let regs = self.text_bytes[offset + 1];
+            let dst = regs & 0x0f;
+            let src = (regs >> 4) & 0x0f;
+            let imm = i32::from_le_bytes(
+                self.text_bytes[offset + 4..offset + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+
+            let mut new_opcode = opcode;
+            let mut new_regs = regs;
+            let mut new_imm = imm;
+
+            match opcode {
+                // eBPF loads -> sBPF v2 loads
+                0x61 => new_opcode = 0x8c, // ldxw
+                0x69 => new_opcode = 0x3c, // ldxh
+                0x71 => new_opcode = 0x2c, // ldxb
+                0x79 => new_opcode = 0x9c, // ldxdw
+
+                // eBPF stores (imm) -> sBPF v2 stores
+                0x62 => new_opcode = 0x87, // stw
+                0x6a => new_opcode = 0x37, // sth
+                0x72 => new_opcode = 0x27, // stb
+                0x7a => new_opcode = 0x97, // stdw
+
+                // eBPF stores (reg) -> sBPF v2 stores
+                0x63 => new_opcode = 0x8f, // stxw
+                0x6b => new_opcode = 0x3f, // stxh
+                0x73 => new_opcode = 0x2f, // stxb
+                0x7b => new_opcode = 0x9f, // stxdw
+
+                // eBPF ALU32 mul/div/mod -> sBPF v2 product/quotient/remainder
+                0x24 => new_opcode = 0x86, // lmul32 imm
+                0x2c => new_opcode = 0x8e, // lmul32 reg
+                0x34 => new_opcode = 0x46, // udiv32 imm
+                0x3c => new_opcode = 0x4e, // udiv32 reg
+                0x94 => new_opcode = 0x66, // urem32 imm
+                0x9c => new_opcode = 0x6e, // urem32 reg
+
+                // eBPF BPF_END (opcode 0xD4) -> sBPF v2 be/and/mov
+                0xd4 => {
+                    if src == 1 {
+                        // BPF_TO_BE => sBPF be
+                        new_opcode = 0xdc;
+                        new_regs = dst; // src=0
+                    } else {
+                        // BPF_TO_LE => lower to AND32 or MOV64
+                        match imm {
+                            16 => {
+                                new_opcode = 0x54; // and32 imm
+                                new_regs = dst; // src=0
+                                new_imm = 0x0000ffff;
+                            }
+                            32 => {
+                                new_opcode = 0x54; // and32 imm
+                                new_regs = dst; // src=0
+                                new_imm = 0xffff_ffffu32 as i32;
+                            }
+                            64 => {
+                                new_opcode = 0xbf; // mov64 reg
+                                new_regs = dst | (dst << 4);
+                                new_imm = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            if new_opcode != opcode {
+                self.text_bytes[offset] = new_opcode;
+            }
+            if new_regs != regs {
+                self.text_bytes[offset + 1] = new_regs;
+            }
+            if new_imm != imm {
+                self.text_bytes[offset + 4..offset + 8].copy_from_slice(&new_imm.to_le_bytes());
+            }
+
+            offset += 8;
         }
         Ok(())
     }
@@ -289,6 +401,15 @@ impl RawSbpfData {
 mod tests {
     use super::*;
 
+    fn inst(opcode: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
+        let mut bytes = [0u8; 8];
+        bytes[0] = opcode;
+        bytes[1] = (dst & 0x0f) | ((src & 0x0f) << 4);
+        bytes[2..4].copy_from_slice(&off.to_le_bytes());
+        bytes[4..8].copy_from_slice(&imm.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn test_raw_sbpf_data_new() {
         let data = RawSbpfData::new();
@@ -297,5 +418,48 @@ mod tests {
         assert!(data.symbols.is_empty());
         assert!(data.relocations.is_empty());
         assert_eq!(data.entry_address, 0);
+    }
+
+    #[test]
+    fn test_convert_ebpf_to_sbpf_v2_opcodes() {
+        let mut data = RawSbpfData::new();
+        data.text_bytes.extend_from_slice(&inst(0x61, 1, 2, 0, 0)); // ldxw
+        data.text_bytes.extend_from_slice(&inst(0x62, 1, 0, 0, 1)); // stw imm
+        data.text_bytes.extend_from_slice(&inst(0x63, 1, 2, 0, 0)); // stxw
+        data.text_bytes.extend_from_slice(&inst(0x24, 1, 0, 0, 2)); // mul32 imm
+        data.text_bytes.extend_from_slice(&inst(0x2c, 1, 2, 0, 0)); // mul32 reg
+        data.text_bytes.extend_from_slice(&inst(0x34, 1, 0, 0, 3)); // div32 imm
+        data.text_bytes.extend_from_slice(&inst(0x3c, 1, 2, 0, 0)); // div32 reg
+        data.text_bytes.extend_from_slice(&inst(0x94, 1, 0, 0, 5)); // mod32 imm
+        data.text_bytes.extend_from_slice(&inst(0x9c, 1, 2, 0, 0)); // mod32 reg
+
+        data.convert_ebpf_to_sbpf_v2().unwrap();
+
+        let opcodes: Vec<u8> = data.text_bytes.iter().step_by(8).cloned().collect();
+        assert_eq!(
+            opcodes,
+            vec![0x8c, 0x87, 0x8f, 0x86, 0x8e, 0x46, 0x4e, 0x66, 0x6e]
+        );
+    }
+
+    #[test]
+    fn test_convert_ebpf_end_to_sbpf_v2() {
+        let mut data = RawSbpfData::new();
+        data.text_bytes.extend_from_slice(&inst(0xd4, 1, 1, 0, 16)); // to_be 16
+        data.text_bytes.extend_from_slice(&inst(0xd4, 2, 0, 0, 16)); // to_le 16
+        data.text_bytes.extend_from_slice(&inst(0xd4, 3, 0, 0, 64)); // to_le 64
+
+        data.convert_ebpf_to_sbpf_v2().unwrap();
+
+        assert_eq!(data.text_bytes[0], 0xdc);
+        assert_eq!(data.text_bytes[1] & 0xf0, 0); // src=0
+
+        assert_eq!(data.text_bytes[8], 0x54);
+        let imm16 = i32::from_le_bytes(data.text_bytes[12..16].try_into().unwrap());
+        assert_eq!(imm16, 0x0000ffff);
+
+        assert_eq!(data.text_bytes[16], 0xbf);
+        let imm64 = i32::from_le_bytes(data.text_bytes[20..24].try_into().unwrap());
+        assert_eq!(imm64, 0);
     }
 }
