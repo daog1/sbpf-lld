@@ -212,7 +212,7 @@ impl<'a> ElfObject<'a> {
             os_abi: elf::ELFOSABI_NONE,
             abi_version: 0,
             e_type: elf::ET_DYN,
-            e_machine: elf::EM_BPF,
+            e_machine: elf::EM_SBF,
             e_entry: entry,
             e_flags: 0,
         })?;
