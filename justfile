@@ -38,7 +38,7 @@ ebpf_so2:
     #!/usr/bin/env zsh
     #~/platform-tools-osx-aarch64/llvm/bin/clang -target bpfel -c -fembed-bitcode -emit-llvm -o optest.bc optest.ll
     #llc -march=bpfel -filetype=obj optest.o -o optest.o
-    SBPF_LLD_V2_STAGE=3 ./target/debug/sbpf-lld optest.bc optest2.so
+    SBPF_LLD_ENABLE_V2_CONVERSION=1 ./target/debug/sbpf-lld optest.bc optest2.so
     #export RUST_LOG=solana_runtime::message_processor=debug
     RUST_LOG=solana_runtime::message_processor=debug,solana_bpf_loader=debug,mollusk=debug ../ryper/target/debug/ryper run-so -v optest2.so
     #../ryper/target/debug/ryper run-so -v optest.so

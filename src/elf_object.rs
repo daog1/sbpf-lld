@@ -8,11 +8,12 @@ use object::write::elf::{
     FileHeader, ProgramHeader, Rel, SectionHeader, SectionIndex, Sym, SymbolIndex, Writer,
 };
 
-use crate::raw_parser::RawSbpfData;
+use crate::raw_parser::{RawRelocation, RawSbpfData};
 
 const DYNAMIC_COUNT: usize = 10;
 const R_BPF_64_RELATIVE: u32 = 8;
 const EF_SBPF_V2: u32 = 2;
+const MM_RODATA_START: u64 = 1u64 << 32;
 
 struct SymbolEntry {
     name_id: StringId,
@@ -66,6 +67,39 @@ impl<'a> ElfObject<'a> {
         Ok(())
     }
 
+    fn read_imm64(text_bytes: &[u8], offset: u64) -> Option<u64> {
+        let low_offset = offset as usize + 4;
+        let high_offset = offset as usize + 12;
+        if high_offset + 4 > text_bytes.len() {
+            return None;
+        }
+        let lo = u32::from_le_bytes(text_bytes[low_offset..low_offset + 4].try_into().ok()?);
+        let hi = u32::from_le_bytes(text_bytes[high_offset..high_offset + 4].try_into().ok()?);
+        Some((hi as u64) << 32 | lo as u64)
+    }
+
+    fn rodata_addr_for_reloc(layout: &Layout, sbpf: &RawSbpfData, reloc: &RawRelocation) -> Option<u64> {
+        if reloc.is_syscall || reloc.is_text_section || !reloc.is_rodata_section {
+            return None;
+        }
+        let key_name = if reloc.symbol_name.is_empty() {
+            format!("rodata_{:x}", reloc.symbol_address)
+        } else {
+            reloc.symbol_name.clone()
+        };
+        let base = *layout.rodata_addrs.get(&key_name)?;
+        let addend = if reloc.addend != 0 {
+            if reloc.addend >= 0 {
+                reloc.addend as u64
+            } else {
+                reloc.addend.wrapping_abs() as u64
+            }
+        } else {
+            Self::read_imm64(&sbpf.text_bytes, reloc.offset)?
+        };
+        base.checked_add(addend)
+    }
+
     fn reserve_layout(&mut self, sbpf: &RawSbpfData) -> Layout {
         let text_size = sbpf.text_bytes.len();
         let relocation_count = sbpf
@@ -78,10 +112,10 @@ impl<'a> ElfObject<'a> {
                 if reloc.is_syscall {
                     return true;
                 }
-                if reloc.symbol_name.is_empty() {
-                    return true;
+                if sbpf.sbpf_v2 {
+                    return false;
                 }
-                sbpf.rodata_symbols.contains_key(&reloc.symbol_name)
+                reloc.is_rodata_section
             })
             .count();
 
@@ -117,6 +151,11 @@ impl<'a> ElfObject<'a> {
         let mut syscall_lookup = HashMap::new();
         let mut syscall_symbols = Vec::new();
         let mut rodata_addrs = HashMap::new();
+        let rodata_addr_base = if sbpf.sbpf_v2 {
+            MM_RODATA_START
+        } else {
+            0
+        };
         let mut dynstr_size = 1u64; // Starting empty string
         for reloc in &sbpf.relocations {
             if reloc.is_text_section {
@@ -128,15 +167,26 @@ impl<'a> ElfObject<'a> {
                 // rodata symbols (or anonymous, address-based rodata references).
                 // Otherwise, we may accidentally patch CALL immediates and trigger
                 // `RelativeJumpOutOfBounds` in the SBPF loader.
-                let (key_name, abs_addr) = if reloc.symbol_name.is_empty() {
+                if !reloc.is_rodata_section {
+                    continue;
+                }
+                let (key_name, abs_addr) = if !reloc.symbol_name.is_empty() {
+                    if let Some(off) = sbpf.rodata_symbols.get(&reloc.symbol_name) {
+                        (
+                            reloc.symbol_name.clone(),
+                            rodata_addr_base + rodata_offset as u64 + *off,
+                        )
+                    } else {
+                        (
+                            format!("rodata_{:x}", reloc.symbol_address),
+                            rodata_addr_base + rodata_offset as u64 + reloc.symbol_address,
+                        )
+                    }
+                } else {
                     (
                         format!("rodata_{:x}", reloc.symbol_address),
-                        rodata_offset as u64 + reloc.symbol_address,
+                        rodata_addr_base + rodata_offset as u64 + reloc.symbol_address,
                     )
-                } else if let Some(off) = sbpf.rodata_symbols.get(&reloc.symbol_name) {
-                    (reloc.symbol_name.clone(), rodata_offset as u64 + *off)
-                } else {
-                    continue;
                 };
                 if rodata_addrs.contains_key(&key_name) {
                     continue;
@@ -209,9 +259,13 @@ impl<'a> ElfObject<'a> {
         } else {
             layout.dynstr_offset as u64 + layout.dynstr_size
         };
-        let rodata_filesz = rodata_end.saturating_sub(layout.dynsym_offset as u64);
-        let text_ro_end =
-            (layout.rodata_offset as u64 + rodata_size).max(layout.text_offset as u64 + text_size);
+        let rodata_start = if rodata_size > 0 {
+            layout.rodata_offset as u64
+        } else {
+            layout.dynsym_offset as u64
+        };
+        let rodata_filesz = rodata_end.saturating_sub(rodata_start);
+        let text_ro_end = layout.text_offset as u64 + text_size;
         let entry = layout.entry;
 
         // File header + program headers
@@ -238,9 +292,9 @@ impl<'a> ElfObject<'a> {
         self.writer.write_program_header(&ProgramHeader {
             p_type: elf::PT_LOAD,
             p_flags: elf::PF_R,
-            p_offset: layout.dynsym_offset as u64,
-            p_vaddr: layout.dynsym_offset as u64,
-            p_paddr: layout.dynsym_offset as u64,
+            p_offset: rodata_start,
+            p_vaddr: rodata_start,
+            p_paddr: rodata_start,
             p_filesz: rodata_filesz,
             p_memsz: rodata_filesz,
             p_align: 0x1000,
@@ -259,11 +313,6 @@ impl<'a> ElfObject<'a> {
         // Section data
         let mut patched_text = sbpf.text_bytes.clone();
         for reloc in &sbpf.relocations {
-            let key_name = if reloc.symbol_name.is_empty() {
-                format!("rodata_{:x}", reloc.symbol_address)
-            } else {
-                reloc.symbol_name.clone()
-            };
             // For non-syscall, directly write rodata absolute addresses
             if reloc.is_syscall {
                 continue;
@@ -271,11 +320,21 @@ impl<'a> ElfObject<'a> {
             if reloc.is_text_section {
                 continue;
             }
-            if let Some(val) = layout.rodata_addrs.get(&key_name) {
+            if let Some(val) = Self::rodata_addr_for_reloc(layout, sbpf, reloc) {
                 let imm_offset = reloc.offset as usize + 4;
-                if imm_offset + 4 <= patched_text.len() {
+                if sbpf.sbpf_v2 {
+                    let hi_offset = reloc.offset as usize + 12;
+                    if imm_offset + 4 <= patched_text.len()
+                        && hi_offset + 4 <= patched_text.len()
+                    {
+                        patched_text[imm_offset..imm_offset + 4]
+                            .copy_from_slice(&(val as u32).to_le_bytes());
+                        patched_text[hi_offset..hi_offset + 4]
+                            .copy_from_slice(&((val >> 32) as u32).to_le_bytes());
+                    }
+                } else if imm_offset + 4 <= patched_text.len() {
                     patched_text[imm_offset..imm_offset + 4]
-                        .copy_from_slice(&(*val as u32).to_le_bytes());
+                        .copy_from_slice(&(val as u32).to_le_bytes());
                 }
             }
         }
@@ -356,21 +415,16 @@ impl<'a> ElfObject<'a> {
                         },
                     );
                 }
-            } else {
+            } else if !sbpf.sbpf_v2 {
                 // rodata etc. use R_BPF_64_RELATIVE, sym=0, plus rodata absolute address
-                let key_name = if reloc.symbol_name.is_empty() {
-                    format!("rodata_{:x}", reloc.symbol_address)
-                } else {
-                    reloc.symbol_name.clone()
-                };
-                if let Some(val) = layout.rodata_addrs.get(&key_name) {
+                if let Some(val) = Self::rodata_addr_for_reloc(layout, sbpf, reloc) {
                     self.writer.write_relocation(
                         false,
                         &Rel {
                             r_offset: layout.text_offset as u64 + reloc.offset,
                             r_sym: 0,
                             r_type: R_BPF_64_RELATIVE,
-                            r_addend: *val as i64,
+                            r_addend: val as i64,
                         },
                     );
                 }
@@ -477,6 +531,7 @@ mod tests {
             is_core_lib: true,
             addend: 0,
             is_text_section: false,
+            is_rodata_section: false,
             target_section_base: None,
         });
 

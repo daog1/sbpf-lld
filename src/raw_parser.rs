@@ -61,6 +61,7 @@ pub struct RawRelocation {
     pub is_core_lib: bool, // whether it's a Rust core library symbol (starts with _ZN4core)
     pub addend: i64,       // addend value
     pub is_text_section: bool,
+    pub is_rodata_section: bool,
     pub target_section_base: Option<u64>,
 }
 
@@ -107,20 +108,22 @@ impl RawSbpfData {
             .context("Failed to extract symbol table")?;
 
         // Normalize to v1/eBPF first, then optionally upgrade to v2.
-        //result
-        //    .convert_ebpf_to_sbpf_v1()
-        //   .context("Failed to convert sBPF v2 to v1")?;
+        // result
+        //     .convert_ebpf_to_sbpf_v1()
+        //     .context("Failed to convert sBPF v2 to v1")?;
 
-        let enable_v2 = std::env::var("SBPF_LLD_ENABLE_V2_CONVERSION")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        //if enable_v2 {
-        result
-            .convert_ebpf_to_sbpf_v2()
-            .context("Failed to convert eBPF to sBPF v2")?;
+        let enable_v2 = true;
+        /* std::env::var("SBPF_LLD_ENABLE_V2_CONVERSION")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);*/
+        if enable_v2 {
+            result
+                .convert_ebpf_to_sbpf_v2()
+                .context("Failed to convert eBPF to sBPF v2")?;
+        }
 
-        result.sbpf_v2 = true;
+        result.sbpf_v2 = enable_v2;
         // Extract .rodata section
         result
             .extract_rodata_section(&obj)
@@ -205,11 +208,11 @@ impl RawSbpfData {
         let stage = std::env::var("SBPF_LLD_V2_STAGE")
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(1)
+            .unwrap_or(3)
             .min(3);
-        let enable_stage1 = true; //stage >= 1;
-        let enable_stage2 = true; //stage >= 2;
-        let enable_stage3 = true; //stage >= 3;
+        let enable_stage1 = stage >= 1;
+        let enable_stage2 = stage >= 2;
+        let enable_stage3 = stage >= 3;
 
         let mut offset = 0usize;
         while offset < self.text_bytes.len() {
@@ -486,6 +489,11 @@ impl RawSbpfData {
         obj: &object::File,
         text_section_bases: &HashMap<object::SectionIndex, u64>,
     ) -> Result<()> {
+        let is_rodata_name = |name: &str| {
+            name.starts_with(".rodata")
+                || name.starts_with(".data.rel.ro")
+                || name.starts_with(".eh_frame")
+        };
         for section in obj.sections() {
             let Ok(name) = section.name() else { continue };
             if !name.starts_with(".text") {
@@ -503,23 +511,24 @@ impl RawSbpfData {
                             let is_syscall =
                                 REGISTERED_SYSCALLS.contains(&symbol_name_str.as_str());
                             let is_core_lib = symbol_name_str.starts_with("_ZN4core");
-                            let (is_text_section, target_section_base) =
+                            let (is_text_section, is_rodata_section, target_section_base) =
                                 match symbol.section_index() {
                                     Some(section_idx) => {
                                         if let Ok(section) = obj.section_by_index(section_idx) {
                                             let name = section.name().unwrap_or_default();
                                             let is_text = name.starts_with(".text");
+                                            let is_rodata = is_rodata_name(name);
                                             let base = if is_text {
                                                 text_section_bases.get(&section_idx).copied()
                                             } else {
                                                 None
                                             };
-                                            (is_text, base)
+                                            (is_text, is_rodata, base)
                                         } else {
-                                            (false, None)
+                                            (false, false, None)
                                         }
                                     }
-                                    None => (false, None),
+                                    None => (false, false, None),
                                 };
                             eprintln!("RelocationTarget {}", symbol_name_str);
                             self.relocations.push(RawRelocation {
@@ -530,23 +539,25 @@ impl RawSbpfData {
                                 is_core_lib,
                                 addend: rel.addend(),
                                 is_text_section,
+                                is_rodata_section,
                                 target_section_base,
                             });
                         }
                     }
                     object::RelocationTarget::Section(section_idx) => {
-                        let (is_text_section, target_section_base) =
+                        let (is_text_section, is_rodata_section, target_section_base) =
                             if let Ok(section) = obj.section_by_index(section_idx) {
                                 let name = section.name().unwrap_or_default();
                                 let is_text = name.starts_with(".text");
+                                let is_rodata = is_rodata_name(name);
                                 let base = if is_text {
                                     text_section_bases.get(&section_idx).copied()
                                 } else {
                                     None
                                 };
-                                (is_text, base)
+                                (is_text, is_rodata, base)
                             } else {
-                                (false, None)
+                                (false, false, None)
                             };
                         self.relocations.push(RawRelocation {
                             offset: base + offset,
@@ -556,6 +567,7 @@ impl RawSbpfData {
                             is_core_lib: false,
                             addend: rel.addend(),
                             is_text_section,
+                            is_rodata_section,
                             target_section_base,
                         });
                     }
@@ -624,8 +636,10 @@ impl RawSbpfData {
             self.patch_immediate(reloc.offset, delta / 8)?;
             return Ok(());
         }
-        // Non-syscall, non-text: keep placeholder, let .rel.dyn patch
-        self.patch_immediate(reloc.offset, 0)?;
+        // Non-syscall, non-text: keep immediate for rodata addends
+        if !reloc.is_rodata_section {
+            self.patch_immediate(reloc.offset, 0)?;
+        }
         Ok(())
     }
 
