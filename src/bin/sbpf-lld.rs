@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
+use sbpf_lld::full_link_program;
 use std::fs;
 use std::path::PathBuf;
-use sbpf_lld::full_link_program;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -22,7 +22,10 @@ struct Cli {
     files: Vec<PathBuf>,
 }
 
-fn split_inputs_output(files: Vec<PathBuf>, out: Option<PathBuf>) -> Result<(Vec<PathBuf>, PathBuf)> {
+fn split_inputs_output(
+    files: Vec<PathBuf>,
+    out: Option<PathBuf>,
+) -> Result<(Vec<PathBuf>, PathBuf)> {
     if let Some(out) = out {
         if files.is_empty() {
             anyhow::bail!("No input files provided");
@@ -54,8 +57,7 @@ fn main() -> Result<()> {
     println!("Output file: {}", output_path.display());
 
     // Use complete version to process files
-    let output_bytes = full_link_program(&input_paths)
-        .context("Failed to link SBPF program")?;
+    let output_bytes = full_link_program(&input_paths).context("Failed to link SBPF program")?;
     println!("Generated {} bytes of output", output_bytes.len());
 
     // Write output file

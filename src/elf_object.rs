@@ -1,17 +1,18 @@
 use anyhow::Result;
 use std::collections::HashMap;
 
+use object::Endianness;
 use object::elf;
+use object::write::StringId;
 use object::write::elf::{
     FileHeader, ProgramHeader, Rel, SectionHeader, SectionIndex, Sym, SymbolIndex, Writer,
 };
-use object::write::StringId;
-use object::Endianness;
 
 use crate::raw_parser::RawSbpfData;
 
 const DYNAMIC_COUNT: usize = 10;
 const R_BPF_64_RELATIVE: u32 = 8;
+const EF_SBPF_V2: u32 = 2;
 
 struct SymbolEntry {
     name_id: StringId,
@@ -71,6 +72,9 @@ impl<'a> ElfObject<'a> {
             .relocations
             .iter()
             .filter(|reloc| {
+                if reloc.is_text_section {
+                    return false;
+                }
                 if reloc.is_syscall {
                     return true;
                 }
@@ -97,9 +101,7 @@ impl<'a> ElfObject<'a> {
         let dynsym_index = self.writer.reserve_dynsym_section_index();
         let _dynstr_index = self.writer.reserve_dynstr_section_index();
         let _rel_dyn_index = self.writer.reserve_section_index();
-        let _shstrtab_index = self
-            .writer
-            .reserve_shstrtab_section_index_with_name(b".s");
+        let _shstrtab_index = self.writer.reserve_shstrtab_section_index_with_name(b".s");
 
         // Section content space: text / rodata / dynamic placeholder first
         let text_offset = self.writer.reserve(text_size, 4);
@@ -117,6 +119,9 @@ impl<'a> ElfObject<'a> {
         let mut rodata_addrs = HashMap::new();
         let mut dynstr_size = 1u64; // Starting empty string
         for reloc in &sbpf.relocations {
+            if reloc.is_text_section {
+                continue;
+            }
             if !reloc.is_syscall {
                 // Record rodata absolute addresses for LDDW and RELATIVE relocations.
                 // Important: only treat relocations as rodata if they are explicitly
@@ -148,7 +153,10 @@ impl<'a> ElfObject<'a> {
             let name_id = self.writer.add_dynamic_string(leaked);
 
             dynstr_size += leaked.len() as u64 + 1;
-            syscall_symbols.push(SymbolEntry { name_id, value: None });
+            syscall_symbols.push(SymbolEntry {
+                name_id,
+                value: None,
+            });
             syscall_lookup.insert(reloc.symbol_name.clone(), sym);
         }
         if dynstr_size < 0x10 {
@@ -160,9 +168,7 @@ impl<'a> ElfObject<'a> {
         // Now reserve dynsym/dynstr/rel.dyn based on added symbols/strings
         let dynsym_offset = self.writer.reserve_dynsym();
         let dynstr_offset = self.writer.reserve_dynstr();
-        let rel_dyn_offset = self
-            .writer
-            .reserve_relocations(relocation_count, false);
+        let rel_dyn_offset = self.writer.reserve_relocations(relocation_count, false);
 
         // Finally reserve shstrtab and section table
         self.writer.reserve_shstrtab();
@@ -204,7 +210,8 @@ impl<'a> ElfObject<'a> {
             layout.dynstr_offset as u64 + layout.dynstr_size
         };
         let rodata_filesz = rodata_end.saturating_sub(layout.dynsym_offset as u64);
-        let text_ro_end = (layout.rodata_offset as u64 + rodata_size).max(layout.text_offset as u64 + text_size);
+        let text_ro_end =
+            (layout.rodata_offset as u64 + rodata_size).max(layout.text_offset as u64 + text_size);
         let entry = layout.entry;
 
         // File header + program headers
@@ -214,7 +221,7 @@ impl<'a> ElfObject<'a> {
             e_type: elf::ET_DYN,
             e_machine: elf::EM_SBF,
             e_entry: entry,
-            e_flags: 0,
+            e_flags: if sbpf.sbpf_v2 { EF_SBPF_V2 } else { 0 },
         })?;
         self.writer.write_align_program_headers();
 
@@ -261,6 +268,9 @@ impl<'a> ElfObject<'a> {
             if reloc.is_syscall {
                 continue;
             }
+            if reloc.is_text_section {
+                continue;
+            }
             if let Some(val) = layout.rodata_addrs.get(&key_name) {
                 let imm_offset = reloc.offset as usize + 4;
                 if imm_offset + 4 <= patched_text.len() {
@@ -284,8 +294,14 @@ impl<'a> ElfObject<'a> {
 
         // If there are no relocations, avoid emitting a DT_REL pointer that points outside any
         // PT_LOAD segment, otherwise mollusk will fail with "invalid dynamic section table".
-        self.writer
-            .write_dynamic(elf::DT_FLAGS, if rel_dyn_size > 0 { elf::DF_TEXTREL as u64 } else { 0 });
+        self.writer.write_dynamic(
+            elf::DT_FLAGS,
+            if rel_dyn_size > 0 {
+                elf::DF_TEXTREL as u64
+            } else {
+                0
+            },
+        );
         self.writer.write_dynamic(elf::DT_REL, rel_addr);
         self.writer.write_dynamic(elf::DT_RELSZ, rel_dyn_size);
         self.writer.write_dynamic(elf::DT_RELENT, 0x10);
@@ -324,6 +340,9 @@ impl<'a> ElfObject<'a> {
 
         self.writer.write_align_relocation();
         for reloc in &sbpf.relocations {
+            if reloc.is_text_section {
+                continue;
+            }
             if reloc.is_syscall {
                 // syscall uses R_BPF_64_32 + dynsym
                 if let Some(sym) = layout.syscall_lookup.get(&reloc.symbol_name) {
@@ -413,7 +432,6 @@ impl<'a> ElfObject<'a> {
     }
 }
 pub fn build_sbpf_so(data: &RawSbpfData) -> Result<Vec<u8>> {
-
     let mut buffer = Vec::new();
     {
         let mut elf_obj = ElfObject::new(&mut buffer);
@@ -458,6 +476,8 @@ mod tests {
             is_syscall: false,
             is_core_lib: true,
             addend: 0,
+            is_text_section: false,
+            target_section_base: None,
         });
 
         let elf = build_sbpf_so(&data).expect("ELF build should succeed");

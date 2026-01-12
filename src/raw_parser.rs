@@ -48,6 +48,7 @@ pub struct RawSbpfData {
     pub rodata_symbols: HashMap<String, u64>, // .rodata symbol name -> offset within section
     pub relocations: Vec<RawRelocation>,      // complete relocation information
     pub entry_address: u64,
+    pub sbpf_v2: bool,
 }
 
 /// Relocation information (based on original byteparser.rs processing logic)
@@ -59,6 +60,8 @@ pub struct RawRelocation {
     pub is_syscall: bool,  // whether it's a syscall in REGISTERED_SYSCALLS
     pub is_core_lib: bool, // whether it's a Rust core library symbol (starts with _ZN4core)
     pub addend: i64,       // addend value
+    pub is_text_section: bool,
+    pub target_section_base: Option<u64>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -84,6 +87,7 @@ impl RawSbpfData {
             rodata_symbols: HashMap::new(),
             relocations: Vec::new(),
             entry_address: 0,
+            sbpf_v2: false,
         }
     }
 
@@ -92,51 +96,65 @@ impl RawSbpfData {
         let obj = object::File::parse(bytes).context("Failed to parse object file")?;
         let mut result = Self::new();
 
-        // Extract symbol table
+        // Extract .text* sections and build section base offsets
+        let text_section_bases = result
+            .extract_text_section(&obj)
+            .context("Failed to extract .text sections")?;
+
+        // Extract symbol table (adjusted for concatenated .text*)
         result
-            .extract_symbols(&obj)
+            .extract_symbols(&obj, &text_section_bases)
             .context("Failed to extract symbol table")?;
 
-        // Extract .text section
-        result
-            .extract_text_section(&obj)
-            .context("Failed to extract .text section")?;
+        // Normalize to v1/eBPF first, then optionally upgrade to v2.
+        //result
+        //    .convert_ebpf_to_sbpf_v1()
+        //   .context("Failed to convert sBPF v2 to v1")?;
 
-        // Convert eBPF instructions to sBPF v2 encoding when explicitly enabled.
-        //let enable_v2 = std::env::var("SBPF_LLD_ENABLE_V2_CONVERSION")
-        //    .ok()
-        //    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        //    .unwrap_or(false);
+        let enable_v2 = std::env::var("SBPF_LLD_ENABLE_V2_CONVERSION")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         //if enable_v2 {
         result
             .convert_ebpf_to_sbpf_v2()
             .context("Failed to convert eBPF to sBPF v2")?;
-        //}
 
+        result.sbpf_v2 = true;
         // Extract .rodata section
         result
             .extract_rodata_section(&obj)
             .context("Failed to extract .rodata section")?;
 
-        // Extract relocation information
+        // Extract relocation information (adjusted for concatenated .text*)
         result
-            .extract_relocations(&obj)
+            .extract_relocations(&obj, &text_section_bases)
             .context("Failed to extract relocations")?;
 
         Ok(result)
     }
 
     /// Extract symbol table
-    fn extract_symbols(&mut self, obj: &object::File) -> Result<()> {
+    fn extract_symbols(
+        &mut self,
+        obj: &object::File,
+        text_section_bases: &HashMap<object::SectionIndex, u64>,
+    ) -> Result<()> {
         for symbol in obj.symbols() {
             if symbol.kind() == object::SymbolKind::Text {
                 if let Ok(name) = symbol.name() {
-                    self.symbols.insert(name.to_string(), symbol.address());
+                    let mut addr = symbol.address();
+                    if let Some(section_idx) = symbol.section_index() {
+                        if let Some(base) = text_section_bases.get(&section_idx) {
+                            addr = base + addr;
+                        }
+                    }
+                    self.symbols.insert(name.to_string(), addr);
                     if name == "entrypoint" {
-                        self.entry_address = symbol.address();
+                        self.entry_address = addr;
                         eprintln!("entrypoint: 0x{:0x}", self.entry_address);
                     }
-                    eprintln!("add function: {} 0x{:0x}", name, symbol.address());
+                    eprintln!("add function: {} 0x{:0x}", name, addr);
                 }
             } else if let Some(section_idx) = symbol.section_index() {
                 if let Ok(section) = obj.section_by_index(section_idx) {
@@ -153,23 +171,46 @@ impl RawSbpfData {
     }
 
     /// Extract .text section raw bytes
-    fn extract_text_section(&mut self, obj: &object::File) -> Result<()> {
+    fn extract_text_section(
+        &mut self,
+        obj: &object::File,
+    ) -> Result<HashMap<object::SectionIndex, u64>> {
+        let mut section_bases = HashMap::new();
         for section in obj.sections() {
-            if section.name() == Ok(".text") {
+            if let Ok(name) = section.name() {
+                if !name.starts_with(".text") {
+                    continue;
+                }
                 let data = section.data()?;
-                self.text_bytes = data.to_vec();
-                println!("Extracted .text section: {} bytes", data.len());
-
-                // Validate instruction integrity
-                self.validate_text_instructions()?;
-                break;
+                let base = self.text_bytes.len() as u64;
+                section_bases.insert(section.index(), base);
+                self.text_bytes.extend_from_slice(data);
+                println!(
+                    "Extracted {}: {} bytes (base 0x{:x})",
+                    name,
+                    data.len(),
+                    base
+                );
             }
         }
-        Ok(())
+        println!("Extracted .text* total: {} bytes", self.text_bytes.len());
+
+        // Validate instruction integrity
+        self.validate_text_instructions()?;
+        Ok(section_bases)
     }
 
     /// Convert eBPF instructions to sBPF v2 encoding in-place.
     fn convert_ebpf_to_sbpf_v2(&mut self) -> Result<()> {
+        let stage = std::env::var("SBPF_LLD_V2_STAGE")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(1)
+            .min(3);
+        let enable_stage1 = true; //stage >= 1;
+        let enable_stage2 = true; //stage >= 2;
+        let enable_stage3 = true; //stage >= 3;
+
         let mut offset = 0usize;
         while offset < self.text_bytes.len() {
             if offset + 8 > self.text_bytes.len() {
@@ -178,7 +219,33 @@ impl RawSbpfData {
 
             let opcode = self.text_bytes[offset];
             if opcode == 0x18 {
-                // LDDW occupies two slots.
+                // LDDW occupies two slots. Lower to mov32 + hor64 for sBPF v2.
+                if enable_stage1 {
+                    let regs = self.text_bytes[offset + 1];
+                    let dst = regs & 0x0f;
+                    let imm_lo = i32::from_le_bytes(
+                        self.text_bytes[offset + 4..offset + 8].try_into().unwrap(),
+                    );
+                    let imm_hi = i32::from_le_bytes(
+                        self.text_bytes[offset + 12..offset + 16]
+                            .try_into()
+                            .unwrap(),
+                    );
+
+                    // mov32 dst, imm_lo
+                    self.text_bytes[offset] = 0xb4;
+                    self.text_bytes[offset + 1] = dst; // src=0
+                    self.text_bytes[offset + 2..offset + 4].copy_from_slice(&0i16.to_le_bytes());
+                    self.text_bytes[offset + 4..offset + 8].copy_from_slice(&imm_lo.to_le_bytes());
+
+                    // hor64 dst, imm_hi
+                    let second = offset + 8;
+                    self.text_bytes[second] = 0xf7;
+                    self.text_bytes[second + 1] = dst; // src=0
+                    self.text_bytes[second + 2..second + 4].copy_from_slice(&0i16.to_le_bytes());
+                    self.text_bytes[second + 4..second + 8].copy_from_slice(&imm_hi.to_le_bytes());
+                }
+
                 offset += 16;
                 continue;
             }
@@ -195,33 +262,40 @@ impl RawSbpfData {
 
             match opcode {
                 // eBPF loads -> sBPF v2 loads
-                0x61 => new_opcode = 0x8c, // ldxw
-                0x69 => new_opcode = 0x3c, // ldxh
-                0x71 => new_opcode = 0x2c, // ldxb
-                0x79 => new_opcode = 0x9c, // ldxdw
+                0x61 if enable_stage1 => new_opcode = 0x8c, // ldxw
+                0x69 if enable_stage1 => new_opcode = 0x3c, // ldxh
+                0x71 if enable_stage1 => new_opcode = 0x2c, // ldxb
+                0x79 if enable_stage1 => new_opcode = 0x9c, // ldxdw
 
                 // eBPF stores (imm) -> sBPF v2 stores
-                0x62 => new_opcode = 0x87, // stw
-                0x6a => new_opcode = 0x37, // sth
-                0x72 => new_opcode = 0x27, // stb
-                0x7a => new_opcode = 0x97, // stdw
+                0x62 if enable_stage1 => new_opcode = 0x87, // stw
+                0x6a if enable_stage1 => new_opcode = 0x37, // sth
+                0x72 if enable_stage1 => new_opcode = 0x27, // stb
+                0x7a if enable_stage1 => new_opcode = 0x97, // stdw
 
                 // eBPF stores (reg) -> sBPF v2 stores
-                0x63 => new_opcode = 0x8f, // stxw
-                0x6b => new_opcode = 0x3f, // stxh
-                //0x73 => new_opcode = 0x2f, // stxb
-                0x7b => new_opcode = 0x9f, // stxdw
+                0x63 if enable_stage1 => new_opcode = 0x8f, // stxw
+                0x6b if enable_stage1 => new_opcode = 0x3f, // stxh
+                0x73 if enable_stage1 => new_opcode = 0x2f, // stxb
+                0x7b if enable_stage1 => new_opcode = 0x9f, // stxdw
 
                 // eBPF ALU32 mul/div/mod -> sBPF v2 product/quotient/remainder
-                0x24 => new_opcode = 0x86, // lmul32 imm
-                0x2c => new_opcode = 0x8e, // lmul32 reg
-                0x34 => new_opcode = 0x46, // udiv32 imm
-                0x3c => new_opcode = 0x4e, // udiv32 reg
-                0x94 => new_opcode = 0x66, // urem32 imm
-                0x9c => new_opcode = 0x6e, // urem32 reg
+                0x24 if enable_stage3 => new_opcode = 0x86, // lmul32 imm
+                0x2c if enable_stage3 => new_opcode = 0x8e, // lmul32 reg
+                0x34 if enable_stage3 => new_opcode = 0x46, // udiv32 imm
+                0x3c if enable_stage3 => new_opcode = 0x4e, // udiv32 reg
+                0x94 if enable_stage3 => new_opcode = 0x66, // urem32 imm
+                0x9c if enable_stage3 => new_opcode = 0x6e, // urem32 reg
+                // eBPF ALU64 mul/div/mod -> sBPF v2 lmul/udiv/urem
+                0x27 if enable_stage2 => new_opcode = 0x96, // lmul64 imm
+                0x2f if enable_stage2 => new_opcode = 0x9e, // lmul64 reg
+                0x37 if enable_stage2 => new_opcode = 0x56, // udiv64 imm
+                0x3f if enable_stage2 => new_opcode = 0x5e, // udiv64 reg
+                0x97 if enable_stage2 => new_opcode = 0x76, // urem64 imm
+                0x9f if enable_stage2 => new_opcode = 0x7e, // urem64 reg
 
                 // eBPF BPF_END (opcode 0xD4) -> sBPF v2 be/and/mov
-                0xd4 => {
+                0xd4 if enable_stage3 => {
                     if src == 1 {
                         // BPF_TO_BE => sBPF be
                         new_opcode = 0xdc;
@@ -246,6 +320,94 @@ impl RawSbpfData {
                             }
                             _ => {}
                         }
+                    }
+                }
+                _ => {}
+            }
+
+            if new_opcode != opcode {
+                self.text_bytes[offset] = new_opcode;
+            }
+            if new_regs != regs {
+                self.text_bytes[offset + 1] = new_regs;
+            }
+            if new_imm != imm {
+                self.text_bytes[offset + 4..offset + 8].copy_from_slice(&new_imm.to_le_bytes());
+            }
+
+            offset += 8;
+        }
+        Ok(())
+    }
+
+    /// Convert sBPF v2 opcodes back to eBPF/v1 encoding in-place.
+    fn convert_ebpf_to_sbpf_v1(&mut self) -> Result<()> {
+        let mut offset = 0usize;
+        while offset < self.text_bytes.len() {
+            if offset + 8 > self.text_bytes.len() {
+                break;
+            }
+
+            let opcode = self.text_bytes[offset];
+            if opcode == 0x18 {
+                // LDDW occupies two slots.
+                offset += 16;
+                continue;
+            }
+
+            let regs = self.text_bytes[offset + 1];
+            let imm =
+                i32::from_le_bytes(self.text_bytes[offset + 4..offset + 8].try_into().unwrap());
+
+            let mut new_opcode = opcode;
+            let mut new_regs = regs;
+            let mut new_imm = imm;
+
+            match opcode {
+                // v2 loads -> eBPF loads
+                0x8c => new_opcode = 0x61, // ldxw
+                0x3c => new_opcode = 0x69, // ldxh
+                0x2c => new_opcode = 0x71, // ldxb
+                0x9c => new_opcode = 0x79, // ldxdw
+
+                // v2 stores (imm) -> eBPF stores
+                0x87 => new_opcode = 0x62, // stw
+                0x37 => new_opcode = 0x6a, // sth
+                0x27 => new_opcode = 0x72, // stb
+                0x97 => new_opcode = 0x7a, // stdw
+
+                // v2 stores (reg) -> eBPF stores
+                0x8f => new_opcode = 0x63, // stxw
+                0x3f => new_opcode = 0x6b, // stxh
+                0x2f => new_opcode = 0x73, // stxb
+                0x9f => new_opcode = 0x7b, // stxdw
+
+                // v2 ALU32 product/quotient/remainder -> eBPF ALU32 mul/div/mod
+                0x86 => new_opcode = 0x24, // mul32 imm
+                0x8e => new_opcode = 0x2c, // mul32 reg
+                0x46 => new_opcode = 0x34, // div32 imm
+                0x4e => new_opcode = 0x3c, // div32 reg
+                0x66 => new_opcode = 0x94, // mod32 imm
+                0x6e => new_opcode = 0x9c, // mod32 reg
+
+                // v2 BPF_END replacements -> v1 BPF_END
+                0xdc => {
+                    // be -> end-to-be
+                    new_opcode = 0xd4;
+                    new_regs = (regs & 0x0f) | (1 << 4);
+                }
+                0x54 => {
+                    if imm == 0x0000ffff || imm == -1 {
+                        new_opcode = 0xd4;
+                        new_regs = regs & 0x0f; // src=0 (to_le)
+                        new_imm = if imm == 0x0000ffff { 16 } else { 32 };
+                    }
+                }
+                0xbf => {
+                    if (regs & 0x0f) == (regs >> 4) && imm == 0 {
+                        new_opcode = 0xd4;
+                        new_regs = regs & 0x0f; // src=0 (to_le)
+                        new_imm = 64;
                     }
                 }
                 _ => {}
@@ -319,31 +481,86 @@ impl RawSbpfData {
     }
 
     /// Extract relocation information
-    fn extract_relocations(&mut self, obj: &object::File) -> Result<()> {
+    fn extract_relocations(
+        &mut self,
+        obj: &object::File,
+        text_section_bases: &HashMap<object::SectionIndex, u64>,
+    ) -> Result<()> {
         for section in obj.sections() {
-            if section.name() == Ok(".text") {
-                for (offset, rel) in section.relocations() {
-                    if let object::RelocationTarget::Symbol(sym_idx) = rel.target() {
+            let Ok(name) = section.name() else { continue };
+            if !name.starts_with(".text") {
+                continue;
+            }
+            let base = text_section_bases
+                .get(&section.index())
+                .copied()
+                .unwrap_or(0);
+            for (offset, rel) in section.relocations() {
+                match rel.target() {
+                    object::RelocationTarget::Symbol(sym_idx) => {
                         if let Some(symbol) = obj.symbol_by_index(sym_idx).ok() {
-                            if let Ok(symbol_name) = symbol.name() {
-                                let symbol_name_str = symbol_name.to_string();
-                                let is_syscall =
-                                    REGISTERED_SYSCALLS.contains(&symbol_name_str.as_str());
-                                let is_core_lib = symbol_name_str.starts_with("_ZN4core");
-                                eprintln!("RelocationTarget {}", symbol_name_str);
-                                self.relocations.push(RawRelocation {
-                                    offset,
-                                    symbol_name: symbol_name_str,
-                                    symbol_address: symbol.address(),
-                                    is_syscall,
-                                    is_core_lib,
-                                    addend: rel.addend(),
-                                });
-                            }
+                            let symbol_name_str = symbol.name().unwrap_or_default().to_string();
+                            let is_syscall =
+                                REGISTERED_SYSCALLS.contains(&symbol_name_str.as_str());
+                            let is_core_lib = symbol_name_str.starts_with("_ZN4core");
+                            let (is_text_section, target_section_base) =
+                                match symbol.section_index() {
+                                    Some(section_idx) => {
+                                        if let Ok(section) = obj.section_by_index(section_idx) {
+                                            let name = section.name().unwrap_or_default();
+                                            let is_text = name.starts_with(".text");
+                                            let base = if is_text {
+                                                text_section_bases.get(&section_idx).copied()
+                                            } else {
+                                                None
+                                            };
+                                            (is_text, base)
+                                        } else {
+                                            (false, None)
+                                        }
+                                    }
+                                    None => (false, None),
+                                };
+                            eprintln!("RelocationTarget {}", symbol_name_str);
+                            self.relocations.push(RawRelocation {
+                                offset: base + offset,
+                                symbol_name: symbol_name_str,
+                                symbol_address: symbol.address(),
+                                is_syscall,
+                                is_core_lib,
+                                addend: rel.addend(),
+                                is_text_section,
+                                target_section_base,
+                            });
                         }
                     }
+                    object::RelocationTarget::Section(section_idx) => {
+                        let (is_text_section, target_section_base) =
+                            if let Ok(section) = obj.section_by_index(section_idx) {
+                                let name = section.name().unwrap_or_default();
+                                let is_text = name.starts_with(".text");
+                                let base = if is_text {
+                                    text_section_bases.get(&section_idx).copied()
+                                } else {
+                                    None
+                                };
+                                (is_text, base)
+                            } else {
+                                (false, None)
+                            };
+                        self.relocations.push(RawRelocation {
+                            offset: base + offset,
+                            symbol_name: String::new(),
+                            symbol_address: 0,
+                            is_syscall: false,
+                            is_core_lib: false,
+                            addend: rel.addend(),
+                            is_text_section,
+                            target_section_base,
+                        });
+                    }
+                    _ => {}
                 }
-                break;
             }
         }
         Ok(())
@@ -377,9 +594,38 @@ impl RawSbpfData {
 
     /// Apply single relocation (based on original byteparser.rs logic)
     fn apply_relocation(&mut self, reloc: &RawRelocation) -> Result<()> {
-        // v0 format: keep placeholder, let .rel.dyn patch
-        let value = if reloc.is_syscall { -1 } else { 0 };
-        self.patch_immediate(reloc.offset, value)?;
+        if reloc.is_syscall {
+            // v0 format: keep placeholder, let .rel.dyn patch
+            self.patch_immediate(reloc.offset, -1)?;
+            return Ok(());
+        }
+        if reloc.is_text_section {
+            let Some(base) = reloc.target_section_base else {
+                anyhow::bail!(
+                    "Missing .text section base for relocation at {:#x}",
+                    reloc.offset
+                );
+            };
+            let addend = if reloc.addend > 0 {
+                reloc.addend as u64
+            } else {
+                0
+            };
+            let target_addr = base + reloc.symbol_address + addend;
+            let next_pc = reloc.offset + 8;
+            let delta = target_addr as i64 - next_pc as i64;
+            if delta % 8 != 0 {
+                anyhow::bail!(
+                    "Unaligned text relocation at {:#x}: delta={}",
+                    reloc.offset,
+                    delta
+                );
+            }
+            self.patch_immediate(reloc.offset, delta / 8)?;
+            return Ok(());
+        }
+        // Non-syscall, non-text: keep placeholder, let .rel.dyn patch
+        self.patch_immediate(reloc.offset, 0)?;
         Ok(())
     }
 
@@ -424,6 +670,7 @@ mod tests {
         assert!(data.symbols.is_empty());
         assert!(data.relocations.is_empty());
         assert_eq!(data.entry_address, 0);
+        assert!(!data.sbpf_v2);
     }
 
     #[test]
@@ -467,5 +714,28 @@ mod tests {
         assert_eq!(data.text_bytes[16], 0xbf);
         let imm64 = i32::from_le_bytes(data.text_bytes[20..24].try_into().unwrap());
         assert_eq!(imm64, 0);
+    }
+
+    #[test]
+    fn test_convert_ebpf_lddw_to_sbpf_v2() {
+        let mut data = RawSbpfData::new();
+        let mut lddw = [0u8; 16];
+        lddw[0] = 0x18; // lddw
+        lddw[1] = 1; // dst=r1
+        lddw[4..8].copy_from_slice(&0x0101_0101u32.to_le_bytes());
+        lddw[12..16].copy_from_slice(&0x0202_0202u32.to_le_bytes());
+        data.text_bytes.extend_from_slice(&lddw);
+
+        data.convert_ebpf_to_sbpf_v2().unwrap();
+
+        assert_eq!(data.text_bytes[0], 0xb4); // mov32 imm
+        assert_eq!(data.text_bytes[1] & 0x0f, 1);
+        let imm_lo = i32::from_le_bytes(data.text_bytes[4..8].try_into().unwrap());
+        assert_eq!(imm_lo as u32, 0x0101_0101);
+
+        assert_eq!(data.text_bytes[8], 0xf7); // hor64 imm
+        assert_eq!(data.text_bytes[9] & 0x0f, 1);
+        let imm_hi = i32::from_le_bytes(data.text_bytes[12..16].try_into().unwrap());
+        assert_eq!(imm_hi as u32, 0x0202_0202);
     }
 }

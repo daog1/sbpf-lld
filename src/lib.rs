@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 pub mod elf_object;
 pub mod murmur3;
@@ -31,13 +32,17 @@ fn ensure_llvm_dylib_on_dyld_fallback_path() {
     use std::path::{Path, PathBuf};
 
     fn has_libllvm_dylib(dir: &Path) -> bool {
-        let Ok(entries) = dir.read_dir() else { return false };
+        let Ok(entries) = dir.read_dir() else {
+            return false;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("dylib") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if stem.starts_with("libLLVM") {
                 return true;
             }
@@ -76,11 +81,41 @@ fn ensure_llvm_dylib_on_dyld_fallback_path() {
 }
 
 /// Detect Solana syscalls in input files
+fn detect_syscalls_from_bc(path: &PathBuf) -> Result<HashSet<Cow<'static, str>>> {
+    let output = Command::new("llvm-nm")
+        .arg("--undefined-only")
+        .arg(path)
+        .output()
+        .with_context(|| format!("Failed to run llvm-nm on {}", path.display()))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "llvm-nm failed on {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let mut syscalls = HashSet::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let name = line.split_whitespace().last().unwrap_or("");
+        if raw_parser::REGISTERED_SYSCALLS.contains(&name) {
+            syscalls.insert(Cow::Owned(name.to_string()));
+        }
+    }
+    Ok(syscalls)
+}
+
 fn detect_sol_syscalls(inputs: &[PathBuf]) -> Result<HashSet<Cow<'static, str>>> {
     use object::{Object as _, ObjectSymbol as _};
 
     let mut syscalls = HashSet::new();
     for path in inputs {
+        if path.extension().and_then(|s| s.to_str()) == Some("bc") {
+            syscalls.extend(detect_syscalls_from_bc(path)?);
+            continue;
+        }
         let data = fs::read(path)
             .with_context(|| format!("Failed to read input file: {}", path.display()))?;
 
@@ -100,6 +135,22 @@ fn detect_sol_syscalls(inputs: &[PathBuf]) -> Result<HashSet<Cow<'static, str>>>
     Ok(syscalls)
 }
 
+fn prefer_bitcode_inputs(inputs: &[PathBuf]) -> Vec<PathBuf> {
+    inputs
+        .iter()
+        .map(|path| {
+            if path.extension().and_then(|s| s.to_str()) == Some("o") {
+                let bc = path.with_extension("bc");
+                if bc.exists() {
+                    println!("Using bitcode input: {} (from {})", bc.display(), path.display());
+                    return bc;
+                }
+            }
+            path.clone()
+        })
+        .collect()
+}
+
 /// Link multiple input files using bpf-linker
 fn link_with_bpf_linker(inputs: &[PathBuf], temp_output: &PathBuf) -> Result<()> {
     use bpf_linker::{Cpu, Linker, LinkerOptions, OptLevel, OutputType};
@@ -113,8 +164,10 @@ fn link_with_bpf_linker(inputs: &[PathBuf], temp_output: &PathBuf) -> Result<()>
         // Solana SBPF programs have a 4KiB stack; bpf-linker defaults are often smaller.
         .unwrap_or(4096);
 
+    let link_inputs = prefer_bitcode_inputs(inputs);
+
     // Detect syscalls that need to be exported
-    let mut export_symbols = detect_sol_syscalls(inputs)?;
+    let mut export_symbols = detect_sol_syscalls(&link_inputs)?;
     export_symbols.insert(Cow::Borrowed("entrypoint")); // Ensure entrypoint is exported
 
     println!("Exported symbols: {:?}", export_symbols);
@@ -123,7 +176,7 @@ fn link_with_bpf_linker(inputs: &[PathBuf], temp_output: &PathBuf) -> Result<()>
         target: None,
         cpu: Cpu::V2, // Use BPF v2 instruction set
         cpu_features: String::new(),
-        inputs: inputs.to_vec(),
+        inputs: link_inputs,
         output: temp_output.clone(),
         output_type: OutputType::Object,
         libs: Vec::new(),
@@ -169,7 +222,7 @@ pub fn full_link_program(inputs: &[PathBuf]) -> Result<Vec<u8>> {
     println!("bpf-linker output: {} bytes", linked_bytes.len());
 
     // 3. Clean up temporary file
-    let _ = fs::remove_file(&temp_output);
+    //let _ = fs::remove_file(&temp_output);
 
     // 4. Parse the linked file and apply SBPF transformation
     let mut sbpf_data = RawSbpfData::from_object_file(&linked_bytes)
