@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::collections::HashMap;
 
 use object::Endianness;
@@ -14,8 +14,13 @@ use crate::SbpfVersion;
 const DYNAMIC_COUNT: usize = 10;
 const EF_SBPF_V2: u32 = 2;
 const EF_SBPF_V3: u32 = 3;
+const ELF_HEADER_SIZE: usize = 64;
+const PROGRAM_HEADER_SIZE: usize = 56;
+const INSN_ALIGN: usize = 8;
+const MM_BYTECODE_START: u64 = 0;
 const MM_RODATA_START: u64 = 1u64 << 32;
-const MM_TEXT_START: u64 = 1u64 << 32;
+const MM_STACK_START: u64 = 2u64 << 32;
+const MM_HEAP_START: u64 = 3u64 << 32;
 
 struct SymbolEntry {
     name_id: StringId,
@@ -30,6 +35,7 @@ pub enum ElfBuildError {
 struct Layout {
     text_size: usize,
     rodata_size: usize,
+    rodata_file_size: usize,
     relocation_count: usize,
     dynsym_count: u32,
     dynstr_size: u64,
@@ -106,8 +112,23 @@ impl<'a> ElfObject<'a> {
     }
 
     fn reserve_layout(&mut self, sbpf: &RawSbpfData) -> Layout {
+        fn align_up(value: usize, align: usize) -> usize {
+            if align == 0 {
+                value
+            } else {
+                (value + align - 1) & !(align - 1)
+            }
+        }
+
         let text_size = sbpf.text_bytes.len();
+        let rodata_size = sbpf.rodata_bytes.len();
+        let rodata_file_size = if sbpf.sbpf_version.is_v3() {
+            align_up(rodata_size, INSN_ALIGN)
+        } else {
+            rodata_size
+        };
         let uses_dynamic = matches!(sbpf.sbpf_version, SbpfVersion::V2);
+        let program_header_count: u32 = if sbpf.sbpf_version.is_v3() { 4 } else { 3 };
         let relocation_count = if uses_dynamic {
             sbpf.relocations
                 .iter()
@@ -124,7 +145,8 @@ impl<'a> ElfObject<'a> {
 
         // Reserve file header and program headers
         self.writer.reserve_file_header();
-        self.writer.reserve_program_headers(if uses_dynamic { 3 } else { 2 });
+        self.writer
+            .reserve_program_headers(program_header_count);
 
         // Section names
         let text_name = self.writer.add_section_name(b".text");
@@ -152,9 +174,26 @@ impl<'a> ElfObject<'a> {
             .reserve_shstrtab_section_index_with_name(b".s");
 
         // Section content space: text / rodata / dynamic placeholder first
-        let text_offset = self.writer.reserve(text_size, 4);
-        let rodata_offset = if !sbpf.rodata_bytes.is_empty() {
-            self.writer.reserve(sbpf.rodata_bytes.len(), 1)
+        let text_align = if sbpf.sbpf_version.is_v3() {
+            INSN_ALIGN
+        } else {
+            4
+        };
+        let rodata_align = if sbpf.sbpf_version.is_v3() {
+            INSN_ALIGN
+        } else {
+            1
+        };
+        let phdr_table_end =
+            ELF_HEADER_SIZE + program_header_count as usize * PROGRAM_HEADER_SIZE;
+        let text_padding =
+            align_up(phdr_table_end, text_align).saturating_sub(phdr_table_end);
+        if text_padding > 0 {
+            self.writer.reserve(text_padding, 1);
+        }
+        let text_offset = self.writer.reserve(text_size, text_align);
+        let rodata_offset = if rodata_file_size > 0 {
+            self.writer.reserve(rodata_file_size, rodata_align)
         } else {
             text_offset + text_size
         };
@@ -165,18 +204,18 @@ impl<'a> ElfObject<'a> {
         };
 
         let text_vaddr = if sbpf.sbpf_version.is_v3() {
-            MM_TEXT_START
+            MM_BYTECODE_START
         } else {
             text_offset as u64
         };
         let rodata_vaddr = if sbpf.sbpf_version.is_v3() {
-            0
+            MM_RODATA_START
         } else {
             rodata_offset as u64
         };
         let rodata_addr_base = match sbpf.sbpf_version {
-            SbpfVersion::V2 => MM_RODATA_START + rodata_vaddr,
-            SbpfVersion::V3 => rodata_vaddr,
+            SbpfVersion::V2 => MM_RODATA_START + rodata_offset as u64,
+            SbpfVersion::V3 => MM_RODATA_START,
         };
 
         // Dynamic symbols and strings: only for v2 syscalls
@@ -268,6 +307,8 @@ impl<'a> ElfObject<'a> {
 
         Layout {
             text_size,
+            rodata_size,
+            rodata_file_size,
             relocation_count,
             dynsym_count,
             dynstr_size,
@@ -277,7 +318,6 @@ impl<'a> ElfObject<'a> {
             dynsym_offset,
             dynstr_offset,
             rel_dyn_offset,
-            rodata_size: sbpf.rodata_bytes.len(),
             entry: text_vaddr + sbpf.entry_address,
             text_index,
             rodata_index,
@@ -297,6 +337,7 @@ impl<'a> ElfObject<'a> {
     fn write_elf(&mut self, sbpf: &RawSbpfData, layout: &Layout) -> Result<()> {
         let text_size = layout.text_size as u64;
         let rodata_size = layout.rodata_size as u64;
+        let rodata_file_size = layout.rodata_file_size as u64;
         let dynamic_size = if layout.uses_dynamic {
             (DYNAMIC_COUNT as u64) * 0x10
         } else {
@@ -327,15 +368,15 @@ impl<'a> ElfObject<'a> {
                     + layout.dynstr_size
             }
         } else {
-            rodata_start + rodata_size
+            rodata_start + rodata_file_size
         };
-        let rodata_filesz = rodata_end.saturating_sub(rodata_start);
-        let entry = layout.entry;
-        let rodata_vaddr = if sbpf.sbpf_version.is_v3() {
-            layout.rodata_vaddr
+        let rodata_filesz = if layout.uses_dynamic {
+            rodata_end.saturating_sub(rodata_start)
         } else {
-            rodata_start
+            rodata_file_size
         };
+        let entry = layout.entry;
+        let rodata_vaddr = layout.rodata_vaddr;
 
         // File header + program headers
         self.writer.write_file_header(&FileHeader {
@@ -351,40 +392,83 @@ impl<'a> ElfObject<'a> {
         })?;
         self.writer.write_align_program_headers();
 
-        self.writer.write_program_header(&ProgramHeader {
-            p_type: elf::PT_LOAD,
-            p_flags: elf::PF_R | elf::PF_X,
-            p_offset: layout.text_offset as u64,
-            p_vaddr: layout.text_vaddr,
-            p_paddr: layout.text_vaddr,
-            p_filesz: text_size,
-            p_memsz: text_size,
-            p_align: 0x1000,
-        });
-        self.writer.write_program_header(&ProgramHeader {
-            p_type: elf::PT_LOAD,
-            p_flags: elf::PF_R,
-            p_offset: rodata_start,
-            p_vaddr: rodata_vaddr,
-            p_paddr: rodata_vaddr,
-            p_filesz: rodata_filesz,
-            p_memsz: rodata_filesz,
-            p_align: 0x1000,
-        });
-        if layout.uses_dynamic {
-            let dynamic_offset = layout
-                .dynamic_offset
-                .expect("dynamic_offset missing for dynamic layout") as u64;
+        if sbpf.sbpf_version.is_v3() {
             self.writer.write_program_header(&ProgramHeader {
-                p_type: elf::PT_DYNAMIC,
-                p_flags: elf::PF_R | elf::PF_W,
-                p_offset: dynamic_offset,
-                p_vaddr: dynamic_offset,
-                p_paddr: dynamic_offset,
-                p_filesz: dynamic_size,
-                p_memsz: dynamic_size,
-                p_align: 8,
+                p_type: elf::PT_LOAD,
+                p_flags: elf::PF_X,
+                p_offset: layout.text_offset as u64,
+                p_vaddr: MM_BYTECODE_START,
+                p_paddr: MM_BYTECODE_START,
+                p_filesz: text_size,
+                p_memsz: text_size,
+                p_align: 0x1000,
             });
+            self.writer.write_program_header(&ProgramHeader {
+                p_type: elf::PT_LOAD,
+                p_flags: elf::PF_R,
+                p_offset: rodata_start,
+                p_vaddr: MM_RODATA_START,
+                p_paddr: MM_RODATA_START,
+                p_filesz: rodata_filesz,
+                p_memsz: rodata_filesz,
+                p_align: 0x1000,
+            });
+            self.writer.write_program_header(&ProgramHeader {
+                p_type: elf::PT_LOAD,
+                p_flags: elf::PF_R | elf::PF_W,
+                p_offset: rodata_start,
+                p_vaddr: MM_STACK_START,
+                p_paddr: MM_STACK_START,
+                p_filesz: 0,
+                p_memsz: 0,
+                p_align: 0x1000,
+            });
+            self.writer.write_program_header(&ProgramHeader {
+                p_type: elf::PT_LOAD,
+                p_flags: elf::PF_R | elf::PF_W,
+                p_offset: rodata_start,
+                p_vaddr: MM_HEAP_START,
+                p_paddr: MM_HEAP_START,
+                p_filesz: 0,
+                p_memsz: 0,
+                p_align: 0x1000,
+            });
+        } else {
+            self.writer.write_program_header(&ProgramHeader {
+                p_type: elf::PT_LOAD,
+                p_flags: elf::PF_R | elf::PF_X,
+                p_offset: layout.text_offset as u64,
+                p_vaddr: layout.text_vaddr,
+                p_paddr: layout.text_vaddr,
+                p_filesz: text_size,
+                p_memsz: text_size,
+                p_align: 0x1000,
+            });
+            self.writer.write_program_header(&ProgramHeader {
+                p_type: elf::PT_LOAD,
+                p_flags: elf::PF_R,
+                p_offset: rodata_start,
+                p_vaddr: rodata_vaddr,
+                p_paddr: rodata_vaddr,
+                p_filesz: rodata_filesz,
+                p_memsz: rodata_filesz,
+                p_align: 0x1000,
+            });
+            if layout.uses_dynamic {
+                let dynamic_offset = layout
+                    .dynamic_offset
+                    .expect("dynamic_offset missing for dynamic layout") as u64;
+                self.writer.write_program_header(&ProgramHeader {
+                    p_type: elf::PT_DYNAMIC,
+                    p_flags: elf::PF_R | elf::PF_W,
+                    p_offset: dynamic_offset,
+                    p_vaddr: dynamic_offset,
+                    p_paddr: dynamic_offset,
+                    p_filesz: dynamic_size,
+                    p_memsz: dynamic_size,
+                    p_align: 8,
+                });
+            }
         }
 
         // Section data
@@ -415,10 +499,15 @@ impl<'a> ElfObject<'a> {
                 }
             }
         }
-        self.writer.write_align(4);
+        self.writer
+            .write_align(if sbpf.sbpf_version.is_v3() { INSN_ALIGN } else { 4 });
         self.writer.write(&patched_text);
         if layout.rodata_size > 0 {
             self.writer.write(&sbpf.rodata_bytes);
+            let pad = layout.rodata_file_size.saturating_sub(layout.rodata_size);
+            if pad > 0 {
+                self.writer.write(&vec![0u8; pad]);
+            }
         }
 
         if layout.uses_dynamic {
@@ -520,7 +609,11 @@ impl<'a> ElfObject<'a> {
             sh_size: text_size,
             sh_link: 0,
             sh_info: 0,
-            sh_addralign: 4,
+            sh_addralign: if sbpf.sbpf_version.is_v3() {
+                INSN_ALIGN as u64
+            } else {
+                4
+            },
             sh_entsize: 0,
         });
         self.writer.write_section_header(&SectionHeader {
@@ -532,7 +625,11 @@ impl<'a> ElfObject<'a> {
             sh_size: rodata_size,
             sh_link: 0,
             sh_info: 0,
-            sh_addralign: 1,
+            sh_addralign: if sbpf.sbpf_version.is_v3() {
+                INSN_ALIGN as u64
+            } else {
+                1
+            },
             sh_entsize: 0,
         });
         if layout.uses_dynamic {
@@ -584,7 +681,39 @@ pub fn build_sbpf_so(data: &RawSbpfData) -> Result<Vec<u8>> {
         let mut elf_obj = ElfObject::new(&mut buffer);
         elf_obj.gen_elf(data)?;
     }
+    if data.sbpf_version.is_v3() {
+        fixup_v3_program_headers(&mut buffer)?;
+    }
     Ok(buffer)
+}
+
+fn fixup_v3_program_headers(buffer: &mut [u8]) -> Result<()> {
+    const PH_FLAGS_OFFSET: usize = 4;
+    if buffer.len() < ELF_HEADER_SIZE {
+        bail!("ELF buffer too small for header");
+    }
+    let e_phoff = u64::from_le_bytes(buffer[0x20..0x28].try_into().unwrap()) as usize;
+    let e_phentsize = u16::from_le_bytes(buffer[0x36..0x38].try_into().unwrap()) as usize;
+    let e_phnum = u16::from_le_bytes(buffer[0x38..0x3A].try_into().unwrap()) as usize;
+    if e_phentsize == 0 || e_phnum < 4 {
+        bail!("ELF program header table is invalid");
+    }
+    let ph_table_end = e_phoff
+        .saturating_add(e_phentsize.saturating_mul(e_phnum as usize));
+    if ph_table_end > buffer.len() {
+        bail!("ELF program header table overruns buffer");
+    }
+    let expected_flags = [
+        elf::PF_X,
+        elf::PF_R,
+        elf::PF_R | elf::PF_W,
+        elf::PF_R | elf::PF_W,
+    ];
+    for (idx, flags) in expected_flags.iter().enumerate() {
+        let off = e_phoff + idx * e_phentsize + PH_FLAGS_OFFSET;
+        buffer[off..off + 4].copy_from_slice(&flags.to_le_bytes());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -646,15 +775,19 @@ mod tests {
         let e_phoff = u64::from_le_bytes(elf[0x20..0x28].try_into().unwrap()) as usize;
         let e_phentsize = u16::from_le_bytes(elf[0x36..0x38].try_into().unwrap()) as usize;
         let e_phnum = u16::from_le_bytes(elf[0x38..0x3A].try_into().unwrap()) as usize;
-        assert_eq!(e_phnum, 2);
+        assert_eq!(e_phnum, 4);
+
+        let text_flags =
+            u32::from_le_bytes(elf[e_phoff + 4..e_phoff + 8].try_into().unwrap());
+        assert_eq!(text_flags, super::elf::PF_X);
 
         let text_vaddr =
             u64::from_le_bytes(elf[e_phoff + 16..e_phoff + 24].try_into().unwrap());
-        assert_eq!(text_vaddr, MM_TEXT_START);
+        assert_eq!(text_vaddr, MM_BYTECODE_START);
 
         let rodata_off = e_phoff + e_phentsize;
         let rodata_vaddr =
             u64::from_le_bytes(elf[rodata_off + 16..rodata_off + 24].try_into().unwrap());
-        assert_eq!(rodata_vaddr, 0);
+        assert_eq!(rodata_vaddr, MM_RODATA_START);
     }
 }

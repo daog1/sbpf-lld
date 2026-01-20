@@ -5,6 +5,10 @@ use std::collections::HashMap;
 
 use crate::murmur3::murmur3_32;
 use crate::SbpfVersion;
+use anyhow::bail;
+
+const SBPF_SYSCALL_OPCODE: u8 = 0x95;
+const SBPF_RETURN_OPCODE: u8 = 0x9d;
 
 /// List of registered Solana SBPF system calls
 /// These syscalls need to be converted to murmur3_32 hash values during relocation
@@ -48,6 +52,7 @@ pub struct RawSbpfData {
     pub text_bytes: Vec<u8>,                  // .text section raw bytes
     pub rodata_bytes: Vec<u8>,                // .rodata section raw bytes
     pub symbols: HashMap<String, u64>,        // .text symbol name -> address
+    pub function_symbols: Vec<u64>,           // function entry addresses
     pub rodata_symbols: HashMap<String, u64>, // .rodata symbol name -> offset within section
     pub relocations: Vec<RawRelocation>,      // complete relocation information
     pub entry_address: u64,
@@ -92,6 +97,7 @@ impl RawSbpfData {
             text_bytes: Vec::new(),
             rodata_bytes: Vec::new(),
             symbols: HashMap::new(),
+            function_symbols: Vec::new(),
             rodata_symbols: HashMap::new(),
             relocations: Vec::new(),
             entry_address: 0,
@@ -150,8 +156,20 @@ impl RawSbpfData {
         obj: &object::File,
         text_section_bases: &HashMap<object::SectionIndex, u64>,
     ) -> Result<()> {
+        fn is_function_symbol(symbol: &object::Symbol) -> bool {
+            if symbol.kind() != object::SymbolKind::Text || !symbol.is_definition() {
+                return false;
+            }
+            match symbol.flags() {
+                object::SymbolFlags::Elf { st_info, .. } => {
+                    (st_info & 0x0f) == object::elf::STT_FUNC
+                }
+                _ => true,
+            }
+        }
+
         for symbol in obj.symbols() {
-            if symbol.kind() == object::SymbolKind::Text {
+            if symbol.kind() == object::SymbolKind::Text && symbol.is_definition() {
                 if let Ok(name) = symbol.name() {
                     let mut addr = symbol.address();
                     if let Some(section_idx) = symbol.section_index() {
@@ -164,7 +182,10 @@ impl RawSbpfData {
                         self.entry_address = addr;
                         eprintln!("entrypoint: 0x{:0x}", self.entry_address);
                     }
-                    eprintln!("add function: {} 0x{:0x}", name, addr);
+                    if is_function_symbol(&symbol) {
+                        self.function_symbols.push(addr);
+                        eprintln!("add function: {} 0x{:0x}", name, addr);
+                    }
                 }
             } else if let Some(section_idx) = symbol.section_index() {
                 if let Ok(section) = obj.section_by_index(section_idx) {
@@ -208,6 +229,240 @@ impl RawSbpfData {
         // Validate instruction integrity
         self.validate_text_instructions()?;
         Ok(section_bases)
+    }
+
+    fn insert_function_start_markers(&mut self) -> Result<()> {
+        if !matches!(self.sbpf_version, SbpfVersion::V3) {
+            return Ok(());
+        }
+
+        let mut function_addrs = Vec::new();
+        function_addrs.push(0);
+        if self.entry_address != 0 {
+            function_addrs.push(self.entry_address);
+        }
+        function_addrs.extend(self.collect_call_targets());
+        function_addrs.sort_unstable();
+        function_addrs.dedup();
+
+        if function_addrs.is_empty() {
+            return Ok(());
+        }
+
+        let mut insert_points: Vec<u64> = Vec::new();
+        for addr in &function_addrs {
+            let addr_usize = *addr as usize;
+            if addr_usize + 8 > self.text_bytes.len() {
+                bail!("Function start out of bounds at {:#x}", addr);
+            }
+            if !Self::is_function_start_marker(&self.text_bytes[addr_usize..addr_usize + 8]) {
+                insert_points.push(*addr);
+            }
+        }
+
+        if insert_points.is_empty() {
+            return Ok(());
+        }
+
+        insert_points.sort_unstable();
+        insert_points.dedup();
+
+        let mut function_pcs = std::collections::HashSet::new();
+        for addr in &function_addrs {
+            function_pcs.insert(addr / 8);
+        }
+        let call_patches = self.compute_call_patches(&insert_points, &function_pcs)?;
+
+        for (idx, addr) in insert_points.iter().enumerate() {
+            let insert_at = addr + (idx as u64 * 8);
+            let insert_at = insert_at as usize;
+            let marker = Self::function_start_marker_bytes();
+            self.text_bytes
+                .splice(insert_at..insert_at, marker.iter().copied());
+        }
+
+        let shift_before = |addr: u64| -> u64 {
+            let count = insert_points.partition_point(|&point| point < addr);
+            (count as u64) * 8
+        };
+        let shift_before_or_equal = |addr: u64| -> u64 {
+            let count = insert_points.partition_point(|&point| point <= addr);
+            (count as u64) * 8
+        };
+
+        self.entry_address = self.entry_address.saturating_add(shift_before(self.entry_address));
+
+        for addr in self.symbols.values_mut() {
+            *addr = addr.saturating_add(shift_before(*addr));
+        }
+
+        for reloc in self.relocations.iter_mut() {
+            reloc.offset = reloc.offset.saturating_add(shift_before_or_equal(reloc.offset));
+            if reloc.is_text_section {
+                let Some(base) = reloc.target_section_base else {
+                    continue;
+                };
+                if let Some(new_addr) = self.symbols.get(&reloc.symbol_name) {
+                    if *new_addr >= base {
+                        reloc.symbol_address = new_addr - base;
+                    }
+                }
+            }
+        }
+
+        for (offset, imm) in call_patches {
+            self.patch_immediate(offset, imm)?;
+        }
+
+        self.rewrite_external_calls_to_syscalls()?;
+        self.rewrite_exit_to_return()?;
+
+        Ok(())
+    }
+
+    fn collect_call_targets(&self) -> Vec<u64> {
+        let mut targets = Vec::new();
+        let text_len = self.text_bytes.len();
+        for pc in (0..text_len).step_by(8) {
+            if pc + 8 > text_len {
+                break;
+            }
+            if self.text_bytes[pc] != 0x85 {
+                continue;
+            }
+            let imm = i32::from_le_bytes(self.text_bytes[pc + 4..pc + 8].try_into().unwrap());
+            let target_pc = (pc as i64 / 8).saturating_add(imm as i64).saturating_add(1);
+            if target_pc < 0 || target_pc >= (text_len as i64 / 8) {
+                continue;
+            }
+            targets.push((target_pc as u64) * 8);
+        }
+        targets
+    }
+
+    fn compute_call_patches(
+        &self,
+        insert_points: &[u64],
+        function_pcs: &std::collections::HashSet<u64>,
+    ) -> Result<Vec<(u64, i64)>> {
+        if insert_points.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut patches = Vec::new();
+        let count_before_or_equal = |addr: u64| -> i64 {
+            insert_points.partition_point(|&point| point <= addr) as i64
+        };
+
+        let text_len = self.text_bytes.len();
+        for pc in (0..text_len).step_by(8) {
+            if pc + 8 > text_len {
+                break;
+            }
+            let opc = self.text_bytes[pc];
+            if opc != 0x85 {
+                continue;
+            }
+            let imm = i32::from_le_bytes(self.text_bytes[pc + 4..pc + 8].try_into().unwrap());
+            let old_pc = (pc / 8) as i64;
+            let target_pc_old = old_pc.saturating_add(imm as i64).saturating_add(1);
+            if target_pc_old < 0 {
+                continue;
+            }
+            if !function_pcs.contains(&(target_pc_old as u64)) {
+                continue;
+            }
+            let old_pc_bytes = (old_pc as u64) * 8;
+            let target_pc_old_bytes = (target_pc_old as u64) * 8;
+            let new_pc =
+                old_pc + count_before_or_equal(old_pc_bytes);
+            let new_target_pc =
+                target_pc_old + count_before_or_equal(target_pc_old_bytes);
+            let new_imm = new_target_pc.saturating_sub(new_pc).saturating_sub(1);
+            if new_imm < i32::MIN as i64 || new_imm > i32::MAX as i64 {
+                bail!("Call immediate out of range after marker insertion");
+            }
+            let new_offset = (new_pc as u64) * 8;
+            patches.push((new_offset, new_imm));
+        }
+
+        Ok(patches)
+    }
+
+    fn rewrite_external_calls_to_syscalls(&mut self) -> Result<()> {
+        if !matches!(self.sbpf_version, SbpfVersion::V3) {
+            return Ok(());
+        }
+
+        let text_len = self.text_bytes.len();
+        let mut markers = std::collections::HashSet::new();
+        for pc in (0..text_len).step_by(8) {
+            if pc + 8 > text_len {
+                break;
+            }
+            if Self::is_function_start_marker(&self.text_bytes[pc..pc + 8]) {
+                markers.insert((pc / 8) as i64);
+            }
+        }
+
+        for pc in (0..text_len).step_by(8) {
+            if pc + 8 > text_len {
+                break;
+            }
+            if self.text_bytes[pc] != 0x85 {
+                continue;
+            }
+            let imm = i32::from_le_bytes(self.text_bytes[pc + 4..pc + 8].try_into().unwrap());
+            let target_pc = (pc as i64 / 8).saturating_add(imm as i64).saturating_add(1);
+            if !markers.contains(&target_pc) {
+                self.text_bytes[pc] = SBPF_SYSCALL_OPCODE;
+                self.text_bytes[pc + 1] = 0;
+                self.text_bytes[pc + 2] = 0;
+                self.text_bytes[pc + 3] = 0;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn rewrite_exit_to_return(&mut self) -> Result<()> {
+        if !matches!(self.sbpf_version, SbpfVersion::V3) {
+            return Ok(());
+        }
+
+        let text_len = self.text_bytes.len();
+        for pc in (0..text_len).step_by(8) {
+            if pc + 8 > text_len {
+                break;
+            }
+            if self.text_bytes[pc] != SBPF_SYSCALL_OPCODE {
+                continue;
+            }
+            let imm = i32::from_le_bytes(self.text_bytes[pc + 4..pc + 8].try_into().unwrap());
+            if imm != 0 {
+                continue;
+            }
+            self.text_bytes[pc] = SBPF_RETURN_OPCODE;
+            self.text_bytes[pc + 1] = 0;
+            self.text_bytes[pc + 2] = 0;
+            self.text_bytes[pc + 3] = 0;
+        }
+
+        Ok(())
+    }
+
+    fn function_start_marker_bytes() -> [u8; 8] {
+        // add64 r10, 0
+        [0x07, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    }
+
+    fn is_function_start_marker(bytes: &[u8]) -> bool {
+        if bytes.len() < 8 {
+            return false;
+        }
+        let opc = bytes[0];
+        let dst = bytes[1] & 0x0f;
+        opc == 0x07 && dst == 10
     }
 
     /// Convert eBPF instructions to sBPF v2 encoding in-place.
@@ -608,6 +863,8 @@ impl RawSbpfData {
             "After applying relocations: .text section size = {}",
             self.text_bytes.len()
         );
+        self.insert_function_start_markers()
+            .context("Failed to insert function start markers")?;
         Ok(())
     }
 
@@ -616,8 +873,7 @@ impl RawSbpfData {
         if reloc.is_syscall {
             if matches!(self.sbpf_version, SbpfVersion::V3) {
                 let hash = murmur3_32(reloc.symbol_name.as_bytes());
-                self.patch_immediate(reloc.offset, hash as i64)?;
-                self.force_call_external(reloc.offset)?;
+                self.patch_syscall(reloc.offset, hash as i64)?;
             } else {
                 // v0/v2 format: keep placeholder, let .rel.dyn patch
                 self.patch_immediate(reloc.offset, -1)?;
@@ -656,14 +912,20 @@ impl RawSbpfData {
         Ok(())
     }
 
-    fn force_call_external(&mut self, offset: u64) -> Result<()> {
-        let regs_offset = offset as usize + 1;
-        if regs_offset >= self.text_bytes.len() {
-            anyhow::bail!("Call instruction out of bounds at offset {:#x}", offset);
+    fn patch_syscall(&mut self, offset: u64, imm: i64) -> Result<()> {
+        let opcode_offset = offset as usize;
+        if opcode_offset + 8 > self.text_bytes.len() {
+            anyhow::bail!("Syscall instruction out of bounds at offset {:#x}", offset);
         }
-        self.text_bytes[regs_offset] &= 0x0f;
+        self.text_bytes[opcode_offset] = SBPF_SYSCALL_OPCODE;
+        self.text_bytes[opcode_offset + 1] = 0;
+        self.text_bytes[opcode_offset + 2] = 0;
+        self.text_bytes[opcode_offset + 3] = 0;
+        self.patch_immediate(offset, imm)?;
         Ok(())
     }
+
+    // No-op placeholder removed; syscall rewrite now happens after marker insertion.
 
     /// Patch immediate field
     fn patch_immediate(&mut self, offset: u64, value: i64) -> Result<()> {
