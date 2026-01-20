@@ -53,6 +53,15 @@ sbpf-lld -o output.so input1.o input2.o
 sbpf-lld --out output.so input1.o input2.o
 ```
 
+### Select SBPF Version (default: v3)
+
+```bash
+sbpf-lld --sbpf-version v3 input1.o input2.o output.so
+sbpf-lld --sbpf-version v2 input1.o input2.o output.so
+```
+
+Note: v3 expects static syscalls (no dynamic symbols/relocations). v2 keeps dynamic syscalls.
+
 ### Environment Variables
 
 - `SBPF_LLD_BPF_STACK_SIZE`: Set BPF stack size (default 4096 bytes, 4KiB)
@@ -79,12 +88,12 @@ sbpf-lld --out output.so input1.o input2.o
 
 ## Development Status
 
-The project is ready for use and supports SVM ELF V0 format. Future versions will consider support for ELF V3 format.
+The project supports SVM ELF v2 and v3 formats (v3 by default).
 
 - ✅ Basic framework and data structures
 - ✅ Section data extraction
 - ✅ Relocation processing (completed)
-- ✅ ELF construction (completed)
+- ✅ ELF construction (completed, v2/v3)
 - ✅ Testing and verification (completed)
 - ✅ eBPF to sBPF v2 instruction conversion (new)
 

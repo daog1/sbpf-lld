@@ -53,6 +53,15 @@ sbpf-lld -o output.so input1.o input2.o
 sbpf-lld --out output.so input1.o input2.o
 ```
 
+### 选择 SBPF 版本（默认 v3）
+
+```bash
+sbpf-lld --sbpf-version v3 input1.o input2.o output.so
+sbpf-lld --sbpf-version v2 input1.o input2.o output.so
+```
+
+说明：v3 期望使用静态 syscall（无动态符号/重定位），v2 保留动态 syscall。
+
 ### 环境变量配置
 
 - `SBPF_LLD_BPF_STACK_SIZE`: 设置 BPF 栈大小（默认 4096 字节，4KiB）
@@ -91,12 +100,12 @@ just run
 
 ## 开发状态
 
-项目已可使用，支持 SVM ELF V0 格式。未来版本将考虑支持 ELF V3 格式。
+项目支持 SVM ELF v2 与 v3 格式（默认 v3）。
 
 - ✅ 基础框架和数据结构
 - ✅ 段数据提取
 - ✅ 重定位处理（已完成）
-- ✅ ELF 构建（已完成）
+- ✅ ELF 构建（已完成，v2/v3）
 - ✅ 测试和验证（已完成）
 - ✅ eBPF 到 sBPF v2 指令转换（新增）
 

@@ -3,6 +3,9 @@ use object::ObjectSection;
 use object::{Object as _, ObjectSymbol as _}; // Import Object and ObjectSymbol traits
 use std::collections::HashMap;
 
+use crate::murmur3::murmur3_32;
+use crate::SbpfVersion;
+
 /// List of registered Solana SBPF system calls
 /// These syscalls need to be converted to murmur3_32 hash values during relocation
 pub const REGISTERED_SYSCALLS: &[&str] = &[
@@ -48,7 +51,7 @@ pub struct RawSbpfData {
     pub rodata_symbols: HashMap<String, u64>, // .rodata symbol name -> offset within section
     pub relocations: Vec<RawRelocation>,      // complete relocation information
     pub entry_address: u64,
-    pub sbpf_v2: bool,
+    pub sbpf_version: SbpfVersion,
 }
 
 /// Relocation information (based on original byteparser.rs processing logic)
@@ -81,6 +84,10 @@ pub enum RawSbpfError {
 
 impl RawSbpfData {
     pub fn new() -> Self {
+        Self::new_with_version(SbpfVersion::V2)
+    }
+
+    pub fn new_with_version(sbpf_version: SbpfVersion) -> Self {
         Self {
             text_bytes: Vec::new(),
             rodata_bytes: Vec::new(),
@@ -88,14 +95,14 @@ impl RawSbpfData {
             rodata_symbols: HashMap::new(),
             relocations: Vec::new(),
             entry_address: 0,
-            sbpf_v2: false,
+            sbpf_version,
         }
     }
 
     /// Extract raw SBPF data from object file
-    pub fn from_object_file(bytes: &[u8]) -> Result<Self> {
+    pub fn from_object_file(bytes: &[u8], sbpf_version: SbpfVersion) -> Result<Self> {
         let obj = object::File::parse(bytes).context("Failed to parse object file")?;
-        let mut result = Self::new();
+        let mut result = Self::new_with_version(sbpf_version);
 
         // Extract .text* sections and build section base offsets
         let text_section_bases = result
@@ -112,7 +119,7 @@ impl RawSbpfData {
         //     .convert_ebpf_to_sbpf_v1()
         //     .context("Failed to convert sBPF v2 to v1")?;
 
-        let enable_v2 = true;
+        let enable_v2 = matches!(sbpf_version, SbpfVersion::V2 | SbpfVersion::V3);
         /* std::env::var("SBPF_LLD_ENABLE_V2_CONVERSION")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -123,7 +130,7 @@ impl RawSbpfData {
                 .context("Failed to convert eBPF to sBPF v2")?;
         }
 
-        result.sbpf_v2 = enable_v2;
+        result.sbpf_version = sbpf_version;
         // Extract .rodata section
         result
             .extract_rodata_section(&obj)
@@ -607,8 +614,14 @@ impl RawSbpfData {
     /// Apply single relocation (based on original byteparser.rs logic)
     fn apply_relocation(&mut self, reloc: &RawRelocation) -> Result<()> {
         if reloc.is_syscall {
-            // v0 format: keep placeholder, let .rel.dyn patch
-            self.patch_immediate(reloc.offset, -1)?;
+            if matches!(self.sbpf_version, SbpfVersion::V3) {
+                let hash = murmur3_32(reloc.symbol_name.as_bytes());
+                self.patch_immediate(reloc.offset, hash as i64)?;
+                self.force_call_external(reloc.offset)?;
+            } else {
+                // v0/v2 format: keep placeholder, let .rel.dyn patch
+                self.patch_immediate(reloc.offset, -1)?;
+            }
             return Ok(());
         }
         if reloc.is_text_section {
@@ -640,6 +653,15 @@ impl RawSbpfData {
         if !reloc.is_rodata_section {
             self.patch_immediate(reloc.offset, 0)?;
         }
+        Ok(())
+    }
+
+    fn force_call_external(&mut self, offset: u64) -> Result<()> {
+        let regs_offset = offset as usize + 1;
+        if regs_offset >= self.text_bytes.len() {
+            anyhow::bail!("Call instruction out of bounds at offset {:#x}", offset);
+        }
+        self.text_bytes[regs_offset] &= 0x0f;
         Ok(())
     }
 
@@ -684,7 +706,7 @@ mod tests {
         assert!(data.symbols.is_empty());
         assert!(data.relocations.is_empty());
         assert_eq!(data.entry_address, 0);
-        assert!(!data.sbpf_v2);
+        assert_eq!(data.sbpf_version, SbpfVersion::V2);
     }
 
     #[test]

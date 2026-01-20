@@ -23,8 +23,61 @@ pub mod raw_parser;
 ))]
 use aya_rustc_llvm_proxy as _;
 
+use bpf_linker::{Cpu, OptLevel};
+use tracing::info;
 pub use elf_object::{ElfBuildError, build_sbpf_so};
 pub use raw_parser::{RawRelocation, RawSbpfData, RawSbpfError};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SbpfVersion {
+    V2,
+    V3,
+}
+
+impl SbpfVersion {
+    pub const fn is_v3(self) -> bool {
+        matches!(self, SbpfVersion::V3)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LinkerConfig {
+    pub target: Option<String>,
+    pub cpu: Cpu,
+    pub cpu_features: String,
+    pub libs: Vec<PathBuf>,
+    pub optimize: OptLevel,
+    pub export_symbols: Vec<String>,
+    pub unroll_loops: bool,
+    pub ignore_inline_never: bool,
+    pub dump_module: Option<PathBuf>,
+    pub llvm_args: Vec<String>,
+    pub disable_expand_memcpy_in_order: bool,
+    pub disable_memory_builtins: bool,
+    pub btf: bool,
+    pub allow_bpf_trap: bool,
+}
+
+impl Default for LinkerConfig {
+    fn default() -> Self {
+        Self {
+            target: None,
+            cpu: Cpu::V2,
+            cpu_features: String::new(),
+            libs: Vec::new(),
+            optimize: OptLevel::No,
+            export_symbols: Vec::new(),
+            unroll_loops: true,
+            ignore_inline_never: false,
+            dump_module: None,
+            llvm_args: Vec::new(),
+            disable_expand_memcpy_in_order: true,
+            disable_memory_builtins: true,
+            btf: false,
+            allow_bpf_trap: false,
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn ensure_llvm_dylib_on_dyld_fallback_path() {
@@ -116,11 +169,16 @@ fn detect_sol_syscalls(inputs: &[PathBuf]) -> Result<HashSet<Cow<'static, str>>>
             syscalls.extend(detect_syscalls_from_bc(path)?);
             continue;
         }
+        if path.extension().and_then(|s| s.to_str()) == Some("rlib") {
+            continue;
+        }
         let data = fs::read(path)
             .with_context(|| format!("Failed to read input file: {}", path.display()))?;
 
-        let obj = object::File::parse(&*data)
-            .with_context(|| format!("Failed to parse object file: {}", path.display()))?;
+        let obj = match object::File::parse(&*data) {
+            Ok(obj) => obj,
+            Err(_) => continue,
+        };
 
         for sym in obj.symbols() {
             if sym.section_index().is_none() {
@@ -152,8 +210,12 @@ fn prefer_bitcode_inputs(inputs: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Link multiple input files using bpf-linker
-fn link_with_bpf_linker(inputs: &[PathBuf], temp_output: &PathBuf) -> Result<()> {
-    use bpf_linker::{Cpu, Linker, LinkerOptions, OptLevel, OutputType};
+fn link_with_bpf_linker(
+    inputs: &[PathBuf],
+    temp_output: &PathBuf,
+    config: &LinkerConfig,
+) -> Result<()> {
+    use bpf_linker::{Linker, LinkerOptions, OutputType};
 
     #[cfg(target_os = "macos")]
     ensure_llvm_dylib_on_dyld_fallback_path();
@@ -169,27 +231,38 @@ fn link_with_bpf_linker(inputs: &[PathBuf], temp_output: &PathBuf) -> Result<()>
     // Detect syscalls that need to be exported
     let mut export_symbols = detect_sol_syscalls(&link_inputs)?;
     export_symbols.insert(Cow::Borrowed("entrypoint")); // Ensure entrypoint is exported
+    for symbol in &config.export_symbols {
+        export_symbols.insert(Cow::Owned(symbol.clone()));
+    }
 
     println!("Exported symbols: {:?}", export_symbols);
 
+    let mut llvm_args = config.llvm_args.clone();
+    if !llvm_args
+        .iter()
+        .any(|arg| arg.contains("bpf-stack-size"))
+    {
+        llvm_args.push(format!("--bpf-stack-size={bpf_stack_size}"));
+    }
+
     let mut linker = Linker::new(LinkerOptions {
-        target: None,
-        cpu: Cpu::V2, // Use BPF v2 instruction set
-        cpu_features: String::new(),
+        target: config.target.clone(),
+        cpu: config.cpu,
+        cpu_features: config.cpu_features.clone(),
         inputs: link_inputs,
         output: temp_output.clone(),
         output_type: OutputType::Object,
-        libs: Vec::new(),
-        optimize: OptLevel::No,
+        libs: config.libs.clone(),
+        optimize: config.optimize,
         export_symbols,
-        unroll_loops: true,
-        ignore_inline_never: false,
-        dump_module: None,
-        llvm_args: vec![format!("--bpf-stack-size={bpf_stack_size}")],
-        disable_expand_memcpy_in_order: true,
-        disable_memory_builtins: true, // Disable memory builtin functions
-        btf: false,
-        allow_bpf_trap: false,
+        unroll_loops: config.unroll_loops,
+        ignore_inline_never: config.ignore_inline_never,
+        dump_module: config.dump_module.clone(),
+        llvm_args,
+        disable_expand_memcpy_in_order: config.disable_expand_memcpy_in_order,
+        disable_memory_builtins: config.disable_memory_builtins, // Disable memory builtin functions
+        btf: config.btf,
+        allow_bpf_trap: config.allow_bpf_trap,
     });
 
     linker
@@ -205,12 +278,27 @@ fn link_with_bpf_linker(inputs: &[PathBuf], temp_output: &PathBuf) -> Result<()>
 }
 
 /// Complete SBPF linking function
-pub fn full_link_program(inputs: &[PathBuf]) -> Result<Vec<u8>> {
+pub fn full_link_program(inputs: &[PathBuf], version: SbpfVersion) -> Result<Vec<u8>> {
+    full_link_program_with_options(inputs, version, &LinkerConfig::default())
+}
+
+pub fn full_link_program_with_options(
+    inputs: &[PathBuf],
+    version: SbpfVersion,
+    config: &LinkerConfig,
+) -> Result<Vec<u8>> {
+    info!(
+        ?version,
+        input_count = inputs.len(),
+        "Starting sbpf-lld linking"
+    );
     // Create temporary file for bpf-linker output
     let temp_output = PathBuf::from("temp_linked.o");
 
     // 1. Link input files using bpf-linker
-    link_with_bpf_linker(inputs, &temp_output).context("Failed during bpf-linker phase")?;
+    link_with_bpf_linker(inputs, &temp_output, config)
+        .context("Failed during bpf-linker phase")?;
+    info!("bpf-linker completed");
 
     // 2. Read the linked result
     let linked_bytes = fs::read(&temp_output).with_context(|| {
@@ -219,22 +307,30 @@ pub fn full_link_program(inputs: &[PathBuf]) -> Result<Vec<u8>> {
             temp_output.display()
         )
     })?;
-    println!("bpf-linker output: {} bytes", linked_bytes.len());
+    info!(bytes = linked_bytes.len(), "Read bpf-linker output");
 
     // 3. Clean up temporary file
     //let _ = fs::remove_file(&temp_output);
 
     // 4. Parse the linked file and apply SBPF transformation
-    let mut sbpf_data = RawSbpfData::from_object_file(&linked_bytes)
+    let mut sbpf_data = RawSbpfData::from_object_file(&linked_bytes, version)
         .context("Failed to parse linked object file")?;
+    info!(
+        text_bytes = sbpf_data.text_bytes.len(),
+        rodata_bytes = sbpf_data.rodata_bytes.len(),
+        relocations = sbpf_data.relocations.len(),
+        "Parsed linked object file"
+    );
 
     // 5. Apply relocations
     sbpf_data
         .apply_relocations()
         .context("Failed to apply relocations")?;
+    info!("Applied relocations");
 
     // 6. Build the final .so file
     let output_bytes = build_sbpf_so(&sbpf_data).context("Failed to build final ELF file")?;
+    info!(bytes = output_bytes.len(), "Built final ELF file");
 
     Ok(output_bytes)
 }
