@@ -1,6 +1,6 @@
 # SBPF 链接器 (sbpf-lld)
 
-一个简化的工具，用于将上游 BPF 二进制文件重新链接为 SBPF V0 兼容格式的 Solana 程序。
+一个简化的工具，用于将上游 BPF 二进制文件重新链接为 SBPF v2/v3 兼容格式的 Solana 程序（默认 v3）。
 
 ## 核心优势
 
@@ -13,14 +13,15 @@
 ## 工作原理
 
 ```
-.o 文件 → bpf-linker → 字节级重定位 → eBPF→sBPF 转换 → .so 输出
+.o 文件 → bpf-linker → 字节级重定位 → eBPF→sBPF 转换 → v3 规范化 → .so 输出
 ```
 
 1. **输入处理**: 接收多个 BPF 对象文件 (.o)
 2. **初始链接**: 使用 bpf-linker 将多个输入文件链接为单个对象文件
 3. **重定位处理**: 直接在字节级别应用 SBPF 特定的重定位
-4. **eBPF 到 sBPF 转换**: 将 eBPF 指令转换为 sBPF v2 编码
-5. **ELF 构建**: 生成最终的 SBPF V0 兼容共享对象 (.so)
+4. **eBPF 到 sBPF 转换**: 需要时将 eBPF 指令转换为 sBPF v2 编码
+5. **v3 规范化**: 应用 v3 的严格要求（静态 syscall、函数起始标记、return 指令）
+6. **ELF 构建**: 生成最终的 SBPF v2/v3 兼容共享对象 (.so)
 
 ## 安装
 
@@ -60,7 +61,14 @@ sbpf-lld --sbpf-version v3 input1.o input2.o output.so
 sbpf-lld --sbpf-version v2 input1.o input2.o output.so
 ```
 
-说明：v3 期望使用静态 syscall（无动态符号/重定位），v2 保留动态 syscall。
+说明：v3 期望使用静态 syscall（SYSCALL imm）并启用严格 ELF 头，v2 保留动态 syscall。
+
+### SBPF v2 与 v3 行为差异
+
+- **syscall**：v2 通过动态重定位调用，v3 使用静态 `SYSCALL imm`（murmur3 哈希）。
+- **ELF 头**：v3 强制严格 PT_LOAD 布局与固定 vaddr（0, 1<<32, 2<<32, 3<<32）。
+- **函数标记**：v3 要求函数起始标记，CALL 目标必须落在标记处。
+- **返回指令**：v2 使用 `EXIT`（0x95），v3 使用 `RETURN`（0x9d）。
 
 ### 环境变量配置
 

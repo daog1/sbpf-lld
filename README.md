@@ -1,6 +1,6 @@
 # SBPF Linker (sbpf-lld)
 
-A streamlined tool that relinks upstream BPF binaries into SBPF V0 compatible format for Solana programs.
+A streamlined tool that relinks upstream BPF binaries into SBPF v2/v3 compatible format for Solana programs (v3 by default).
 
 ## Core Advantages
 
@@ -13,14 +13,15 @@ Compared to the original complex sbpf-linker implementation, this project is sig
 ## How It Works
 
 ```
-.o files → bpf-linker → byte-level relocations → eBPF→sBPF conversion → .so output
+.o files → bpf-linker → byte-level relocations → eBPF→sBPF conversion → v3 normalization → .so output
 ```
 
 1. **Input Processing**: Receives multiple BPF object files (.o)
 2. **Initial Linking**: Uses bpf-linker to link multiple input files into a single object file
 3. **Relocation Processing**: Applies SBPF-specific relocations directly at the byte level
-4. **eBPF to sBPF Conversion**: Converts eBPF instructions to sBPF v2 encoding
-5. **ELF Construction**: Generates final SBPF V0 compatible shared object (.so)
+4. **eBPF to sBPF Conversion**: Converts eBPF instructions to sBPF v2 encoding when needed
+5. **v3 Normalization**: Applies strict v3 requirements (static syscalls, function markers, return opcode)
+6. **ELF Construction**: Generates final SBPF v2/v3 compatible shared object (.so)
 
 ## Installation
 
@@ -60,7 +61,14 @@ sbpf-lld --sbpf-version v3 input1.o input2.o output.so
 sbpf-lld --sbpf-version v2 input1.o input2.o output.so
 ```
 
-Note: v3 expects static syscalls (no dynamic symbols/relocations). v2 keeps dynamic syscalls.
+Note: v3 expects static syscalls (SYSCALL imm) and strict ELF headers. v2 keeps dynamic syscalls.
+
+### SBPF v2 vs v3 behavior
+
+- **Syscalls**: v2 uses dynamic syscall relocations; v3 uses static `SYSCALL imm` (murmur3 hash).
+- **ELF headers**: v3 enforces strict PT_LOAD layout and fixed vaddrs (0, 1<<32, 2<<32, 3<<32).
+- **Function markers**: v3 requires function start markers; CALL targets must land on a marker.
+- **Return opcode**: v2 uses `EXIT` (0x95), v3 uses `RETURN` (0x9d).
 
 ### Environment Variables
 
